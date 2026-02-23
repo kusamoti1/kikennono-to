@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-NoticeForge Core Logic v4.0 (NotebookLM Binder & OCR Integrated)
+NoticeForge Core Logic v5.0 (Ultimate: DocuWorks/Excel-MD/LongPath/Binder)
 """
 from __future__ import annotations
-import os, re, json, time, hashlib, csv
+import os, sys, re, json, time, hashlib, csv, subprocess
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional, Callable
 
@@ -35,13 +35,17 @@ try:
 except Exception:
     openpyxl = None
 
+try:
+    import xlrd
+except Exception:
+    xlrd = None
+
 DEFAULTS: Dict[str, object] = {
-    "min_chars_mainbody": 800,
+    "min_chars_mainbody": 400, # 基準を少し甘くして抽出漏れを防止
     "max_depth": 30,
     "summary_chars": 900,
-    # 厳格な分割キーワード (行頭付近にある場合のみ切断)
     "main_attach_split_keywords": [r"^\s*別添", r"^\s*別紙", r"^\s*【別添】", r"^\s*【別紙】", r"^\s*【参考】", r"^\s*記\s*$"],
-    "bind_bytes_limit": 15 * 1024 * 1024, # 約15MBごとに分割（NotebookLM用）
+    "bind_bytes_limit": 15 * 1024 * 1024,
     "use_ocr": False,
 }
 
@@ -89,42 +93,35 @@ class Record:
     tags_work: List[str]
     tag_evidence: Dict[str, List[str]]
     out_txt: str
-    full_text_for_bind: str = "" # バインド用のフルテキスト保持
+    full_text_for_bind: str = ""
 
-def sha1_file(path: str) -> str:
-    h = hashlib.sha1()
-    try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(2 * 1024 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return "000000"
+def get_safe_path(path: str) -> str:
+    """Windowsの260文字制限(MAX_PATH)を突破するための安全なパス変換"""
+    abs_path = os.path.abspath(path)
+    if sys.platform.startswith("win") and not abs_path.startswith("\\\\?\\"):
+        return "\\\\?\\" + abs_path
+    return abs_path
 
 def extract_pdf(path: str, use_ocr: bool) -> Tuple[str, Optional[int], str]:
     if not fitz: return "", None, "pymupdf_missing"
     text_parts = []
     method = "pdf_text"
     try:
-        doc = fitz.open(path)
+        doc = fitz.open(get_safe_path(path))
         pages = doc.page_count
         for i in range(pages):
             page = doc.load_page(i)
             page_text = page.get_text("text") or ""
-            
-            # テキストが極端に少ない場合、画像PDFとみなしてOCRを実行
             if use_ocr and len(page_text.strip()) < 50 and TESSERACT_AVAILABLE:
                 try:
                     pix = page.get_pixmap(dpi=200)
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     ocr_text = pytesseract.image_to_string(img, lang="jpn")
-                    # OCRのノイズ掃除（過剰なスペース除去）
                     ocr_text = re.sub(r'([ぁ-んァ-ン一-龥])\s+([ぁ-んァ-ン一-龥])', r'\1\2', ocr_text)
                     page_text += "\n" + ocr_text
                     method = "pdf_ocr"
                 except Exception:
                     pass
-                    
             text_parts.append(page_text)
         doc.close()
         return "\n".join(text_parts), pages, method
@@ -134,13 +131,57 @@ def extract_pdf(path: str, use_ocr: bool) -> Tuple[str, Optional[int], str]:
 def extract_docx(path: str) -> Tuple[str, str]:
     if not Document: return "", "docx_missing"
     try:
-        doc = Document(path)
+        doc = Document(get_safe_path(path))
         return "\n".join([p.text for p in doc.paragraphs if p.text]), "docx_text"
     except Exception as e:
         return "", f"docx_err:{e.__class__.__name__}"
 
+def extract_excel(path: str) -> Tuple[str, str]:
+    """新旧エクセルを読み込み、AIが理解しやすいMarkdown表形式に整形する"""
+    out = []
+    ext = os.path.splitext(path)[1].lower()
+    safe_p = get_safe_path(path)
+    try:
+        if ext in (".xlsx", ".xlsm") and openpyxl:
+            wb = openpyxl.load_workbook(safe_p, data_only=True, read_only=True)
+            for ws in wb.worksheets[:10]:
+                out.append(f"## Sheet: {ws.title}")
+                for row in ws.iter_rows(max_row=400, max_col=40, values_only=True):
+                    if any(row):
+                        out.append("| " + " | ".join([str(c).strip().replace("\n", " ") if c is not None else "" for c in row]) + " |")
+                out.append("")
+            wb.close()
+            return "\n".join(out), "xlsx_md"
+        elif ext == ".xls" and xlrd:
+            wb = xlrd.open_workbook(safe_p)
+            for sheet_idx in range(min(10, wb.nsheets)):
+                ws = wb.sheet_by_index(sheet_idx)
+                out.append(f"## Sheet: {ws.name}")
+                for row_idx in range(min(400, ws.nrows)):
+                    row = ws.row_values(row_idx)
+                    if any(row):
+                        out.append("| " + " | ".join([str(c).strip().replace("\n", " ") if c else "" for c in row]) + " |")
+                out.append("")
+            return "\n".join(out), "xls_md"
+        else:
+            return "", "excel_lib_missing"
+    except Exception as e:
+        return "", f"excel_err:{e.__class__.__name__}"
+
+def extract_xdw(path: str) -> Tuple[str, str]:
+    """DocuWorksから直接テキストを抽出（xdw2textコマンドを使用）"""
+    safe_p = get_safe_path(path)
+    try:
+        result = subprocess.run(["xdw2text", safe_p], capture_output=True, text=True, encoding="cp932", errors="ignore")
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout, "xdw_text"
+        return "", "xdw_empty_or_protected"
+    except FileNotFoundError:
+        return "", "xdw2text_missing (要xdw2text.exe導入)"
+    except Exception as e:
+        return "", f"xdw_err:{e.__class__.__name__}"
+
 def split_main_attach(text: str, kws: List[str]) -> Tuple[str, str]:
-    # 校正者指摘：行頭付近のキーワードのみで切断する
     lines = text.splitlines()
     cut_idx = -1
     for i, line in enumerate(lines):
@@ -150,14 +191,13 @@ def split_main_attach(text: str, kws: List[str]) -> Tuple[str, str]:
                 break
         if cut_idx != -1: break
 
-    if cut_idx > 5: # あまりに早すぎる切断は無視
+    if cut_idx > 5:
         main_text = "\n".join(lines[:cut_idx])
         attach_text = "\n".join(lines[cut_idx:])
         return main_text.strip(), attach_text.strip()
     return text.strip(), ""
 
 def convert_japanese_year(text: str) -> str:
-    # NotebookLM最適化：和暦を西暦に翻訳補完
     def replacer(match):
         era = match.group(1)
         year_str = match.group(2)
@@ -172,8 +212,7 @@ def convert_japanese_year(text: str) -> str:
 def guess_title(text: str, fallback: str) -> str:
     for l in text.splitlines()[:50]:
         s = l.strip()
-        if 6 <= len(s) <= 120 and not re.match(r"^[\d\-\s\(\)]+$", s):
-            return s
+        if 6 <= len(s) <= 120 and not re.match(r"^[\d\-\s\(\)]+$", s): return s
     return fallback
 
 def guess_date(text: str) -> str:
@@ -196,8 +235,7 @@ def tag_text(text: str) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
     for t, ps in WORK_TAGS.items():
         if hits := [p for p in ps if re.search(p, target)]:
             work.append(t); ev[t] = hits[:3]
-    if not fac and re.search(r"危険物|消防法", target):
-        fac.append("共通")
+    if not fac and re.search(r"危険物|消防法", target): fac.append("共通")
     return fac, work, ev
 
 def make_summary(main_text: str, n: int) -> str:
@@ -209,11 +247,15 @@ def write_excel_index(outdir: str, records: List[Record]):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Index"
-    headers = ["タイトル(推定)", "日付(推定)", "発出者(推定)", "施設タグ", "業務タグ", "needs_review", "理由", "概要(先頭)", "元ファイル"]
-    ws.append(headers)
+    ws.append(["タイトル(推定)", "日付(推定)", "発出者(推定)", "施設タグ", "業務タグ", "needs_review", "理由", "概要(先頭)", "元ファイル"])
     for r in records:
         ws.append([r.title_guess, r.date_guess, r.issuer_guess, " / ".join(r.tags_facility), " / ".join(r.tags_work), "TRUE" if r.needs_review else "FALSE", r.reason, r.summary, r.relpath])
-    wb.save(os.path.join(outdir, "00_統合目次.xlsx"))
+    
+    excel_path = os.path.join(outdir, "00_統合目次.xlsx")
+    try:
+        wb.save(excel_path)
+    except PermissionError:
+        raise PermissionError("00_統合目次.xlsx が他のアプリで開かれています。閉じてからやり直してください。")
 
 def write_md_indices(outdir: str, records: List[Record]):
     with open(os.path.join(outdir, "00_統合目次.md"), "w", encoding="utf-8") as f:
@@ -222,7 +264,6 @@ def write_md_indices(outdir: str, records: List[Record]):
             f.write(f"- **{r.title_guess}**\n  - 日付: {r.date_guess} / 発出: {r.issuer_guess}\n  - タグ: [{'/'.join(r.tags_facility)}] [{'/'.join(r.tags_work)}]\n  - 概要: {r.summary}\n  - 元: `{r.relpath}`\n\n")
 
 def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
-    # NotebookLM用の巨大結合ファイルを作成
     chunk_idx = 1
     current_size = 0
     current_lines = []
@@ -230,8 +271,7 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
     def flush():
         nonlocal chunk_idx, current_size, current_lines
         if not current_lines: return
-        path = os.path.join(outdir, f"NotebookLM用_統合データ_{chunk_idx:02d}.txt")
-        with open(path, "w", encoding="utf-8") as f:
+        with open(os.path.join(outdir, f"NotebookLM用_統合データ_{chunk_idx:02d}.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(current_lines))
         chunk_idx += 1
         current_size = 0
@@ -239,19 +279,15 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
 
     for r in records:
         if not r.full_text_for_bind.strip(): continue
-        # 明確な区切り線
         block = f"\n\n{'='*60}\n【DOCUMENT START】\n元ファイル: {r.relpath}\n抽出方式: {r.method}\n{'-'*60}\n{r.full_text_for_bind}\n{'='*60}\n\n"
         b_len = len(block.encode("utf-8"))
-        if current_size + b_len > limit_bytes and current_size > 0:
-            flush()
+        if current_size + b_len > limit_bytes and current_size > 0: flush()
         current_lines.append(block)
         current_size += b_len
     flush()
 
 def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_callback: Optional[Callable[[int, int, str, str], None]] = None) -> Tuple[int, int]:
-    # 安全のため毎回作り直す仕様
     os.makedirs(outdir, exist_ok=True)
-    
     max_depth = int(cfg.get("max_depth", 30))
     split_kws = list(cfg.get("main_attach_split_keywords", []))
     min_chars = int(cfg.get("min_chars_mainbody", 800))
@@ -275,7 +311,10 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
                 text, pages, method = extract_pdf(path, use_ocr)
             elif ext == ".docx":
                 text, method = extract_docx(path)
-            # NotebookLMに不要なファイルは一旦スキップするか抽出機能を残す
+            elif ext in (".xlsx", ".xlsm", ".xls"):
+                text, method = extract_excel(path)
+            elif ext in (".xdw", ".xbd"):
+                text, method = extract_xdw(path)
         except Exception as e:
             method, reason = "error", f"抽出エラー: {e.__class__.__name__}"
 
@@ -287,22 +326,18 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         fac, work, ev = tag_text(main or text)
 
         needs_rev = False
-        if method in ("unhandled", "error") or len(main or text) < min_chars:
+        if method in ("unhandled", "error") or "missing" in method or len(main or text) < min_chars:
             needs_rev = True
-            reason = reason or "本文が短すぎる、または画像PDF（要OCR）"
+            reason = reason or "本文が短すぎる、または画像ファイル"
 
         summary = make_summary(main or text, int(cfg.get("summary_chars", 900)))
-        
-        # NotebookLM用合体テキスト作成のための文字列
         payload = f"タイトル(推定): {title}\n日付(推定): {date_guess}\n発出者(推定): {issuer_guess}\n\n# 本文\n{main.strip()}"
         if attach.strip(): payload += f"\n\n# 添付資料\n{attach.strip()}"
 
-        records.append(Record(relpath=rel, ext=ext, size=os.path.getsize(path), mtime=os.path.getmtime(path), sha1="", method=method, pages=pages, text_chars=len(text), needs_review=needs_rev, reason=reason, title_guess=title, date_guess=date_guess, issuer_guess=issuer_guess, summary=summary, tags_facility=fac, tags_work=work, tag_evidence=ev, out_txt="", full_text_for_bind=payload))
+        records.append(Record(relpath=rel, ext=ext, size=os.path.getsize(get_safe_path(path)), mtime=os.path.getmtime(get_safe_path(path)), sha1="", method=method, pages=pages, text_chars=len(text), needs_review=needs_rev, reason=reason, title_guess=title, date_guess=date_guess, issuer_guess=issuer_guess, summary=summary, tags_facility=fac, tags_work=work, tag_evidence=ev, out_txt="", full_text_for_bind=payload))
 
-    # 結果の出力
     write_excel_index(outdir, records)
     write_md_indices(outdir, records)
     write_binded_texts(outdir, records, limit_bytes)
     
-    needs = [r for r in records if r.needs_review]
-    return len(records), len(needs)
+    return len(records), len([r for r in records if r.needs_review])
