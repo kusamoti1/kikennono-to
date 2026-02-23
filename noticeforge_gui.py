@@ -15,21 +15,23 @@ except Exception as e:
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
-APP_TITLE = "NoticeForge v4.0（NotebookLM最適化・OCR統合版）"
+APP_TITLE = "NoticeForge v5.0（NotebookLM完全版・防弾仕様）"
 
 HELP_RIGHT = """ここだけ読めばOK
 
 【1】通知を入力フォルダに入れる。
-【2】古い画像PDFがある場合は
-　　「OCRを実行」にチェックを入れる。
+【2】画像PDFがある場合は
+　　「OCRを実行」にチェック。
 【3】「処理開始」を押す。
-※出力先は毎回リセット（上書き）されます。
+※出力先は毎回リセットされます。
+※Excelを開いたままだとエラーになるので
+　閉じてから開始してください。
 
 【NotebookLMに入れるもの】
 出力フォルダにある
 ・ 00_統合目次.md
 ・ NotebookLM用_統合データ_〇〇.txt
-だけをNotebookLMに入れればOKです！
+だけをNotebookLMに入れます。
 """
 
 class App(ctk.CTk):
@@ -53,8 +55,8 @@ class App(ctk.CTk):
 
         header = ctk.CTkFrame(self, corner_radius=0)
         header.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ctk.CTkLabel(header, text="NoticeForge v4.0", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(16, 4))
-        ctk.CTkLabel(header, text="危険物通知 → NotebookLM用合体テキストを全自動生成", text_color="gray").pack(pady=(0, 16))
+        ctk.CTkLabel(header, text="NoticeForge v5.0", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(16, 4))
+        ctk.CTkLabel(header, text="全ファイル対応（DocuWorks/新旧Excel/PDF）→ NotebookLM用データ自動生成", text_color="gray").pack(pady=(0, 16))
 
         main = ctk.CTkFrame(self, fg_color="transparent")
         main.grid(row=1, column=0, sticky="nsew", padx=(20, 10), pady=10)
@@ -77,10 +79,9 @@ class App(ctk.CTk):
         self.out_btn = ctk.CTkButton(step, text="変更…", width=160, command=self.pick_output, fg_color="#6b7280")
         self.out_btn.grid(row=3, column=2, padx=12, pady=(0, 12))
 
-        # OCRオプション
         opt_frame = ctk.CTkFrame(main, fg_color="transparent")
         opt_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        self.chk_ocr = ctk.CTkCheckBox(opt_frame, text="読めないPDFにOCR（画像文字認識）を実行する ※Tesseract必須・時間がかかります", variable=self.use_ocr, font=ctk.CTkFont(weight="bold"))
+        self.chk_ocr = ctk.CTkCheckBox(opt_frame, text="読めないPDFにOCR（画像文字認識）を実行する ※時間がかかります", variable=self.use_ocr, font=ctk.CTkFont(weight="bold"))
         self.chk_ocr.pack(side="left", padx=12)
 
         self.run_btn = ctk.CTkButton(main, text="③ 処理開始（出力先はリセットされます）", height=48, font=ctk.CTkFont(size=16, weight="bold"), command=self.start)
@@ -140,18 +141,6 @@ class App(ctk.CTk):
         self.out_entry.configure(state=state)
         self.chk_ocr.configure(state=state)
 
-    def pick_input(self):
-        p = filedialog.askdirectory(title="入力フォルダを選択")
-        if p:
-            self.input_dir.set(p)
-            if not self.output_dir.get():
-                self.output_dir.set(os.path.join(p, "output_noticeforge"))
-
-    def pick_output(self):
-        p = filedialog.askdirectory(title="出力フォルダを選択")
-        if p:
-            self.output_dir.set(p)
-
     def start(self):
         indir = self.input_dir.get()
         outdir = self.output_dir.get()
@@ -162,7 +151,6 @@ class App(ctk.CTk):
             messagebox.showwarning("確認", "出力フォルダが選択されていません。")
             return
 
-        # 警告ポップアップ
         ans = messagebox.askyesno("確認", f"出力フォルダ ({os.path.basename(outdir)}) の内容を再構築（上書き）します。\nよろしいですか？\n※元のファイルは消えません。")
         if not ans:
             return
@@ -189,8 +177,10 @@ class App(ctk.CTk):
             total, needs = core.process_folder(indir, outdir, cfg, cb)
             msg = f"完了しました。総数: {total} / 要確認: {needs}\nNotebookLM用の結合データを作成しました。"
             self.after(0, lambda: self._done(msg, False, outdir))
+        except PermissionError as pe:
+            self.after(0, lambda: self._done(str(pe), True, outdir))
         except Exception as e:
-            msg = f"エラー: {type(e).__name__}: {e}"
+            msg = f"致命的なエラー: {type(e).__name__}: {e}"
             self.after(0, lambda: self._done(msg, True, outdir))
 
     def _progress(self, curr: int, total: int, msg: str):
