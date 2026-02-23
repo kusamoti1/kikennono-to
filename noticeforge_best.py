@@ -1,16 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-NoticeForge Core Logic v3.1 (GUI Optimized + Excel Index + LONG SUMMARY)
+NoticeForge Core Logic v4.0 (NotebookLM Binder & OCR Integrated)
 """
 from __future__ import annotations
 import os, re, json, time, hashlib, csv
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional, Callable
 
+# Tesseractの設定 (Windowsの一般的なパス)
+TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
 try:
     import fitz  # PyMuPDF
 except Exception:
     fitz = None
+
+try:
+    import pytesseract
+    from PIL import Image
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+    TESSERACT_AVAILABLE = True
+except Exception:
+    TESSERACT_AVAILABLE = False
 
 try:
     from docx import Document
@@ -28,7 +39,10 @@ DEFAULTS: Dict[str, object] = {
     "min_chars_mainbody": 800,
     "max_depth": 30,
     "summary_chars": 900,
-    "main_attach_split_keywords": ["別添", "別紙", "参考", "添付", "（写）", "(写)", "【別添】", "【別紙】", "【参考】"],
+    # 厳格な分割キーワード (行頭付近にある場合のみ切断)
+    "main_attach_split_keywords": [r"^\s*別添", r"^\s*別紙", r"^\s*【別添】", r"^\s*【別紙】", r"^\s*【参考】", r"^\s*記\s*$"],
+    "bind_bytes_limit": 15 * 1024 * 1024, # 約15MBごとに分割（NotebookLM用）
+    "use_ocr": False,
 }
 
 FACILITY_TAGS: Dict[str, List[str]] = {
@@ -75,6 +89,7 @@ class Record:
     tags_work: List[str]
     tag_evidence: Dict[str, List[str]]
     out_txt: str
+    full_text_for_bind: str = "" # バインド用のフルテキスト保持
 
 def sha1_file(path: str) -> str:
     h = hashlib.sha1()
@@ -86,88 +101,73 @@ def sha1_file(path: str) -> str:
     except Exception:
         return "000000"
 
-def safe_mkdir(p: str):
-    os.makedirs(p, exist_ok=True)
-
-def safe_filename(base: str) -> str:
-    s = re.sub(r"[^0-9A-Za-zぁ-んァ-ン一-龥\-\_]+", "_", base)[:110]
-    return s or "doc"
-
-def sniff_type(path: str) -> str:
-    try:
-        with open(path, "rb") as f:
-            head = f.read(8)
-        if head.startswith(b"%PDF"):
-            return "pdf"
-        if head.startswith(b"PK\x03\x04"):
-            return "zip"
-    except Exception:
-        pass
-    return "unknown"
-
-def extract_pdf(path: str) -> Tuple[str, Optional[int], str]:
-    if not fitz:
-        return "", None, "pymupdf_missing"
+def extract_pdf(path: str, use_ocr: bool) -> Tuple[str, Optional[int], str]:
+    if not fitz: return "", None, "pymupdf_missing"
+    text_parts = []
+    method = "pdf_text"
     try:
         doc = fitz.open(path)
         pages = doc.page_count
-        parts = []
         for i in range(pages):
-            parts.append(doc.load_page(i).get_text("text") or "")
+            page = doc.load_page(i)
+            page_text = page.get_text("text") or ""
+            
+            # テキストが極端に少ない場合、画像PDFとみなしてOCRを実行
+            if use_ocr and len(page_text.strip()) < 50 and TESSERACT_AVAILABLE:
+                try:
+                    pix = page.get_pixmap(dpi=200)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    ocr_text = pytesseract.image_to_string(img, lang="jpn")
+                    # OCRのノイズ掃除（過剰なスペース除去）
+                    ocr_text = re.sub(r'([ぁ-んァ-ン一-龥])\s+([ぁ-んァ-ン一-龥])', r'\1\2', ocr_text)
+                    page_text += "\n" + ocr_text
+                    method = "pdf_ocr"
+                except Exception:
+                    pass
+                    
+            text_parts.append(page_text)
         doc.close()
-        return "\n".join(parts), pages, "pdf_text"
+        return "\n".join(text_parts), pages, method
     except Exception as e:
         return "", None, f"pdf_err:{e.__class__.__name__}"
 
 def extract_docx(path: str) -> Tuple[str, str]:
-    if not Document:
-        return "", "docx_missing"
+    if not Document: return "", "docx_missing"
     try:
         doc = Document(path)
         return "\n".join([p.text for p in doc.paragraphs if p.text]), "docx_text"
     except Exception as e:
         return "", f"docx_err:{e.__class__.__name__}"
 
-def extract_xlsx(path: str) -> Tuple[str, str]:
-    if not openpyxl:
-        return "", "openpyxl_missing"
-    try:
-        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-        out = []
-        for ws in wb.worksheets[:10]:
-            out.append(f"## Sheet: {ws.title}")
-            for row in ws.iter_rows(max_row=400, max_col=40, values_only=True):
-                if any(row):
-                    out.append(" | ".join(["" if c is None else str(c).strip() for c in row]))
-            out.append("")
-        wb.close()
-        return "\n".join(out), "xlsx"
-    except Exception as e:
-        return "", f"xlsx_err:{e.__class__.__name__}"
-
-def extract_text_file(path: str) -> Tuple[str, str]:
-    for enc in ("utf-8", "utf-8-sig", "cp932", "shift_jis"):
-        try:
-            with open(path, "r", encoding=enc) as f:
-                return f.read(), f"text_{enc}"
-        except Exception:
-            continue
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read(), "text_lossy"
-    except Exception:
-        return "", "text_read_fail"
-
 def split_main_attach(text: str, kws: List[str]) -> Tuple[str, str]:
-    idxs = []
-    for k in kws:
-        m = re.search(re.escape(k), text)
-        if m:
-            idxs.append(m.start())
-    cut = min(idxs) if idxs else -1
-    if cut > 200:
-        return text[:cut].strip(), text[cut:].strip()
+    # 校正者指摘：行頭付近のキーワードのみで切断する
+    lines = text.splitlines()
+    cut_idx = -1
+    for i, line in enumerate(lines):
+        for k in kws:
+            if re.match(k, line):
+                cut_idx = i
+                break
+        if cut_idx != -1: break
+
+    if cut_idx > 5: # あまりに早すぎる切断は無視
+        main_text = "\n".join(lines[:cut_idx])
+        attach_text = "\n".join(lines[cut_idx:])
+        return main_text.strip(), attach_text.strip()
     return text.strip(), ""
+
+def convert_japanese_year(text: str) -> str:
+    # NotebookLM最適化：和暦を西暦に翻訳補完
+    def replacer(match):
+        era = match.group(1)
+        year_str = match.group(2)
+        year = 1 if year_str == "元" else int(year_str)
+        if era == "令和": west_year = 2018 + year
+        elif era == "平成": west_year = 1988 + year
+        elif era == "昭和": west_year = 1925 + year
+        else: return match.group(0)
+        return f"{match.group(0)}（{west_year}年）"
+    return re.sub(r"(令和|平成|昭和)\s*([0-9元]+)\s*年", replacer, text)
 
 def guess_title(text: str, fallback: str) -> str:
     for l in text.splitlines()[:50]:
@@ -177,30 +177,24 @@ def guess_title(text: str, fallback: str) -> str:
     return fallback
 
 def guess_date(text: str) -> str:
-    m = re.search(r"(令和|平成)\s*\d+\s*年\s*\d+\s*月\s*\d+\s*日", text)
-    if m:
-        return m.group(0)
+    m = re.search(r"(令和|平成|昭和)\s*[0-9元]+\s*年\s*\d+\s*月\s*\d+\s*日(（\d{4}年）)?", text)
+    if m: return m.group(0)
     m2 = re.search(r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日", text)
     return m2.group(0) if m2 else ""
 
 def guess_issuer(text: str) -> str:
     for cand in ["消防庁", "総務省消防庁", "消防局", "危険物保安室", "予防課"]:
-        if cand in text:
-            return cand
+        if cand in text: return cand
     return ""
 
 def tag_text(text: str) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
-    ev: Dict[str, List[str]] = {}
-    fac: List[str] = []
-    work: List[str] = []
+    ev: Dict[str, List[str]] = {}; fac: List[str] = []; work: List[str] = []
     target = text[:8000]
     for t, ps in FACILITY_TAGS.items():
-        hits = [p for p in ps if re.search(p, target)]
-        if hits:
+        if hits := [p for p in ps if re.search(p, target)]:
             fac.append(t); ev[t] = hits[:3]
     for t, ps in WORK_TAGS.items():
-        hits = [p for p in ps if re.search(p, target)]
-        if hits:
+        if hits := [p for p in ps if re.search(p, target)]:
             work.append(t); ev[t] = hits[:3]
     if not fac and re.search(r"危険物|消防法", target):
         fac.append("共通")
@@ -211,136 +205,81 @@ def make_summary(main_text: str, n: int) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 def write_excel_index(outdir: str, records: List[Record]):
-    if not openpyxl:
-        return
+    if not openpyxl: return
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Index"
-
-    headers = [
-        "タイトル(推定)", "日付(推定)", "発出者(推定)",
-        "施設タグ", "業務タグ", "needs_review", "理由", "概要(先頭)",
-        "元ファイル(relpath)", "生成テキスト(out_txt)"
-    ]
+    headers = ["タイトル(推定)", "日付(推定)", "発出者(推定)", "施設タグ", "業務タグ", "needs_review", "理由", "概要(先頭)", "元ファイル"]
     ws.append(headers)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(wrap_text=True, vertical="top")
-
     for r in records:
-        ws.append([
-            r.title_guess, r.date_guess, r.issuer_guess,
-            " / ".join(r.tags_facility) if r.tags_facility else "",
-            " / ".join(r.tags_work) if r.tags_work else "",
-            "TRUE" if r.needs_review else "FALSE",
-            r.reason,
-            r.summary,
-            r.relpath,
-            r.out_txt,
-        ])
-
-    widths = [40, 16, 14, 24, 24, 12, 26, 80, 50, 40]
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    for row in ws.iter_rows(min_row=2):
-        for c in row:
-            c.alignment = Alignment(wrap_text=True, vertical="top")
-
-    ws2 = wb.create_sheet("NeedsReview")
-    ws2.append(headers)
-    for cell in ws2[1]:
-        cell.font = Font(bold=True)
-    for r in records:
-        if r.needs_review:
-            ws2.append([
-                r.title_guess, r.date_guess, r.issuer_guess,
-                " / ".join(r.tags_facility) if r.tags_facility else "",
-                " / ".join(r.tags_work) if r.tags_work else "",
-                "TRUE", r.reason, r.summary, r.relpath, r.out_txt
-            ])
-    for i, w in enumerate(widths, 1):
-        ws2.column_dimensions[get_column_letter(i)].width = w
-    for row in ws2.iter_rows(min_row=2):
-        for c in row:
-            c.alignment = Alignment(wrap_text=True, vertical="top")
-
+        ws.append([r.title_guess, r.date_guess, r.issuer_guess, " / ".join(r.tags_facility), " / ".join(r.tags_work), "TRUE" if r.needs_review else "FALSE", r.reason, r.summary, r.relpath])
     wb.save(os.path.join(outdir, "00_統合目次.xlsx"))
 
 def write_md_indices(outdir: str, records: List[Record]):
-    def md_line(r: Record) -> str:
-        return (
-            f"- **{r.title_guess}**\n"
-            f"  - 日付(推定): {r.date_guess} / 発出者(推定): {r.issuer_guess}\n"
-            f"  - タグ: 施設=[{' / '.join(r.tags_facility)}] / 業務=[{' / '.join(r.tags_work)}]\n"
-            f"  - needs_review: {'True' if r.needs_review else 'False'} / 理由: {r.reason}\n"
-            f"  - 概要: {r.summary}\n"
-            f"  - 元: `{r.relpath}`\n"
-            f"  - テキスト: `{r.out_txt}`\n\n"
-        )
     with open(os.path.join(outdir, "00_統合目次.md"), "w", encoding="utf-8") as f:
         f.write("# 統合目次（概要付き）\n\n")
         for r in records:
-            f.write(md_line(r))
+            f.write(f"- **{r.title_guess}**\n  - 日付: {r.date_guess} / 発出: {r.issuer_guess}\n  - タグ: [{'/'.join(r.tags_facility)}] [{'/'.join(r.tags_work)}]\n  - 概要: {r.summary}\n  - 元: `{r.relpath}`\n\n")
 
-def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_callback: Optional[Callable[[int, int, str], None]] = None) -> Tuple[int, int]:
-    safe_mkdir(outdir)
-    safe_mkdir(os.path.join(outdir, "docs_txt"))
+def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
+    # NotebookLM用の巨大結合ファイルを作成
+    chunk_idx = 1
+    current_size = 0
+    current_lines = []
+    
+    def flush():
+        nonlocal chunk_idx, current_size, current_lines
+        if not current_lines: return
+        path = os.path.join(outdir, f"NotebookLM用_統合データ_{chunk_idx:02d}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(current_lines))
+        chunk_idx += 1
+        current_size = 0
+        current_lines = []
 
+    for r in records:
+        if not r.full_text_for_bind.strip(): continue
+        # 明確な区切り線
+        block = f"\n\n{'='*60}\n【DOCUMENT START】\n元ファイル: {r.relpath}\n抽出方式: {r.method}\n{'-'*60}\n{r.full_text_for_bind}\n{'='*60}\n\n"
+        b_len = len(block.encode("utf-8"))
+        if current_size + b_len > limit_bytes and current_size > 0:
+            flush()
+        current_lines.append(block)
+        current_size += b_len
+    flush()
+
+def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_callback: Optional[Callable[[int, int, str, str], None]] = None) -> Tuple[int, int]:
+    # 安全のため毎回作り直す仕様
+    os.makedirs(outdir, exist_ok=True)
+    
     max_depth = int(cfg.get("max_depth", 30))
-    split_kws = list(cfg.get("main_attach_split_keywords", DEFAULTS["main_attach_split_keywords"]))  # type: ignore
+    split_kws = list(cfg.get("main_attach_split_keywords", []))
     min_chars = int(cfg.get("min_chars_mainbody", 800))
-    summary_chars = int(cfg.get("summary_chars", 900))
+    use_ocr = bool(cfg.get("use_ocr", False))
+    limit_bytes = int(cfg.get("bind_bytes_limit", 15000000))
 
-    targets: List[str] = []
-    for root, _, files in os.walk(indir):
-        if os.path.relpath(root, indir).count(os.sep) >= max_depth:
-            continue
-        for fn in files:
-            targets.append(os.path.join(root, fn))
-
+    targets = [os.path.join(root, fn) for root, _, files in os.walk(indir) if os.path.relpath(root, indir).count(os.sep) < max_depth for fn in files]
     total_files = len(targets)
     records: List[Record] = []
 
     for i, path in enumerate(targets):
         rel = os.path.relpath(path, indir)
-        if progress_callback:
-            progress_callback(i + 1, total_files, rel)
-
-        try:
-            st = os.stat(path)
-        except Exception:
-            continue
-
         ext = os.path.splitext(path)[1].lower()
-        sniff = sniff_type(path)
-        sha1 = sha1_file(path)
+        if progress_callback: progress_callback(i + 1, total_files, rel, "(抽出中...)")
 
-        text = ""
-        pages: Optional[int] = None
-        method = "unhandled"
-        reason = ""
-
+        text, method, reason, pages = "", "unhandled", "", None
+        
         try:
-            if ext == ".pdf" or sniff == "pdf":
-                text, pages, method = extract_pdf(path)
+            if ext == ".pdf":
+                if use_ocr and progress_callback: progress_callback(i + 1, total_files, rel, "(OCR処理中...時間がかかります)")
+                text, pages, method = extract_pdf(path, use_ocr)
             elif ext == ".docx":
                 text, method = extract_docx(path)
-            elif ext in (".xlsx", ".xlsm"):
-                text, method = extract_xlsx(path)
-            elif ext in (".txt", ".md", ".csv"):
-                text, method = extract_text_file(path)
-            elif ext in (".xdw", ".xbd"):
-                method = "xdw_skipped"
-                reason = "DocuWorksは原本確認が必要（本文抽出は未対応）"
-            else:
-                reason = f"未対応拡張子: {ext}"
+            # NotebookLMに不要なファイルは一旦スキップするか抽出機能を残す
         except Exception as e:
-            method = "error"
-            reason = f"抽出エラー: {e.__class__.__name__}"
+            method, reason = "error", f"抽出エラー: {e.__class__.__name__}"
 
-        if not text and not reason and method != "xdw_skipped":
-            reason = f"本文が空（抽出方式={method}）"
-
+        text = convert_japanese_year(text)
         main, attach = split_main_attach(text, split_kws)
         title = guess_title(main or text, os.path.basename(path))
         date_guess = guess_date(text)
@@ -348,73 +287,22 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         fac, work, ev = tag_text(main or text)
 
         needs_rev = False
-        if method in ("unhandled", "error", "xdw_skipped") or reason.startswith("未対応拡張子"):
+        if method in ("unhandled", "error") or len(main or text) < min_chars:
             needs_rev = True
-        if not needs_rev and len(main or text) < min_chars:
-            needs_rev = True
-            reason = reason or "本文が短い（要確認）"
+            reason = reason or "本文が短すぎる、または画像PDF（要OCR）"
 
-        summary = make_summary(main or text, summary_chars)
+        summary = make_summary(main or text, int(cfg.get("summary_chars", 900)))
+        
+        # NotebookLM用合体テキスト作成のための文字列
+        payload = f"タイトル(推定): {title}\n日付(推定): {date_guess}\n発出者(推定): {issuer_guess}\n\n# 本文\n{main.strip()}"
+        if attach.strip(): payload += f"\n\n# 添付資料\n{attach.strip()}"
 
-        stem = safe_filename(os.path.splitext(rel)[0])
-        out_txt_rel = f"docs_txt/{stem}_{sha1[:6]}.txt"
-        out_txt_abs = os.path.join(outdir, out_txt_rel)
+        records.append(Record(relpath=rel, ext=ext, size=os.path.getsize(path), mtime=os.path.getmtime(path), sha1="", method=method, pages=pages, text_chars=len(text), needs_review=needs_rev, reason=reason, title_guess=title, date_guess=date_guess, issuer_guess=issuer_guess, summary=summary, tags_facility=fac, tags_work=work, tag_evidence=ev, out_txt="", full_text_for_bind=payload))
 
-        payload = []
-        payload.append("# 文書メタデータ")
-        payload.append(f"- 元ファイル: {rel}")
-        payload.append(f"- タイトル(推定): {title}")
-        if date_guess:
-            payload.append(f"- 日付(推定): {date_guess}")
-        if issuer_guess:
-            payload.append(f"- 発出者(推定): {issuer_guess}")
-        payload.append(f"- 抽出方式: {method}")
-        payload.append(f"- needs_review: {'True' if needs_rev else 'False'}")
-        if reason:
-            payload.append(f"- 理由: {reason}")
-        payload.append(f"- 施設タグ: {' / '.join(fac) if fac else '（なし）'}")
-        payload.append(f"- 業務タグ: {' / '.join(work) if work else '（なし）'}")
-        payload.append("")
-        payload.append("# 概要（先頭）")
-        payload.append(summary if summary else "(概要なし)")
-        payload.append("")
-        payload.append("# 本文")
-        payload.append(main.strip() if main.strip() else "(本文抽出なし)")
-        if attach.strip():
-            payload.append("")
-            payload.append("# 別添・別紙・参考")
-            payload.append(attach.strip())
-
-        try:
-            with open(out_txt_abs, "w", encoding="utf-8") as f:
-                f.write("\n".join(payload))
-        except Exception as e:
-            needs_rev = True
-            reason = f"書き込み失敗: {e.__class__.__name__}"
-
-        records.append(Record(
-            relpath=rel, ext=ext, size=int(st.st_size), mtime=float(st.st_mtime),
-            sha1=sha1, method=method, pages=pages,
-            text_chars=len(text), needs_review=needs_rev, reason=reason,
-            title_guess=title, date_guess=date_guess, issuer_guess=issuer_guess,
-            summary=summary, tags_facility=fac, tags_work=work, tag_evidence=ev,
-            out_txt=out_txt_rel
-        ))
-
-        time.sleep(0.001)
-
+    # 結果の出力
     write_excel_index(outdir, records)
     write_md_indices(outdir, records)
-
+    write_binded_texts(outdir, records, limit_bytes)
+    
     needs = [r for r in records if r.needs_review]
-    if needs:
-        with open(os.path.join(outdir, "needs_review.csv"), "w", encoding="utf-8-sig", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["relpath", "method", "reason", "title_guess", "out_txt"])
-            for r in needs:
-                w.writerow([r.relpath, r.method, r.reason, r.title_guess, r.out_txt])
-
-    with open(os.path.join(outdir, "ledger.json"), "w", encoding="utf-8") as f:
-        json.dump([asdict(r) for r in records], f, ensure_ascii=False, indent=2)
-
     return len(records), len(needs)
