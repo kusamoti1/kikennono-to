@@ -30,7 +30,7 @@ except Exception:
 
 try:
     import openpyxl
-    from openpyxl.styles import Font, Alignment
+    from openpyxl.styles import Font, Alignment, PatternFill
     from openpyxl.utils import get_column_letter
 except Exception:
     openpyxl = None
@@ -109,20 +109,33 @@ def extract_pdf(path: str, use_ocr: bool) -> Tuple[str, Optional[int], str]:
     try:
         doc = fitz.open(get_safe_path(path))
         pages = doc.page_count
+
+        # まず全ページのテキストを収集
+        raw_texts = [doc.load_page(i).get_text("text") or "" for i in range(pages)]
+        total_chars = sum(len(t.strip()) for t in raw_texts)
+
+        # 画像PDF判定：1ページ平均30字未満 → OCR有効時は全ページOCRする
+        is_image_pdf = use_ocr and TESSERACT_AVAILABLE and total_chars < max(30 * pages, 100)
+
         for i in range(pages):
-            page = doc.load_page(i)
-            page_text = page.get_text("text") or ""
-            if use_ocr and len(page_text.strip()) < 50 and TESSERACT_AVAILABLE:
+            page_text = raw_texts[i]
+            do_ocr_this_page = (
+                use_ocr and TESSERACT_AVAILABLE
+                and (is_image_pdf or len(page_text.strip()) < 50)
+            )
+            if do_ocr_this_page:
                 try:
-                    pix = page.get_pixmap(dpi=200)
+                    pix = doc.load_page(i).get_pixmap(dpi=200)
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     ocr_text = pytesseract.image_to_string(img, lang="jpn")
                     ocr_text = re.sub(r'([ぁ-んァ-ン一-龥])\s+([ぁ-んァ-ン一-龥])', r'\1\2', ocr_text)
-                    page_text += "\n" + ocr_text
-                    method = "pdf_ocr"
+                    # 画像PDF：OCRテキストのみ / 部分欠損：テキスト＋OCRを結合
+                    page_text = ocr_text if is_image_pdf else (page_text + "\n" + ocr_text)
+                    method = "pdf_ocr" if is_image_pdf else "pdf_ocr_partial"
                 except Exception:
                     pass
             text_parts.append(page_text)
+
         doc.close()
         return "\n".join(text_parts), pages, method
     except Exception as e:
@@ -252,13 +265,67 @@ def _xls_safe(s) -> str:
 
 def write_excel_index(outdir: str, records: List[Record]):
     if not openpyxl: return
+
+    HDR_FILL  = PatternFill("solid", fgColor="1F4E79")   # 濃紺：ヘッダー
+    OK_FILL   = PatternFill("solid", fgColor="E8F5E9")   # 薄緑：正常
+    REV_FILL  = PatternFill("solid", fgColor="FFF9C4")   # 薄黄：要確認
+    ERR_FILL  = PatternFill("solid", fgColor="FFEBEE")   # 薄赤：エラー
+    HDR_FONT  = Font(bold=True, color="FFFFFF", size=10)
+    BODY_FONT = Font(size=10)
+    WRAP      = Alignment(wrap_text=True, vertical="top")
+    HDR_ALIGN = Alignment(wrap_text=True, vertical="center", horizontal="center")
+
+    def _style_header(ws, col_widths):
+        for i, (cell, w) in enumerate(zip(ws[1], col_widths), 1):
+            cell.fill = HDR_FILL
+            cell.font = HDR_FONT
+            cell.alignment = HDR_ALIGN
+            ws.column_dimensions[get_column_letter(i)].width = w
+        ws.row_dimensions[1].height = 28
+        ws.freeze_panes = "A2"
+
+    def _style_row(ws, row_num: int, fill):
+        for cell in ws[row_num]:
+            cell.fill = fill
+            cell.font = BODY_FONT
+            cell.alignment = WRAP
+
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Index"
-    ws.append(["タイトル(推定)", "日付(推定)", "発出者(推定)", "施設タグ", "業務タグ", "needs_review", "理由", "概要(先頭)", "元ファイル"])
-    for r in records:
-        ws.append([_xls_safe(r.title_guess), _xls_safe(r.date_guess), _xls_safe(r.issuer_guess), " / ".join(r.tags_facility), " / ".join(r.tags_work), "TRUE" if r.needs_review else "FALSE", _xls_safe(r.reason), _xls_safe(r.summary), _xls_safe(r.relpath)])
-    
+
+    # ─── Sheet 1: 全体目次（人が確認用）───────────────────────────────
+    ws1 = wb.active
+    ws1.title = "① 全体目次"
+    ws1.append(["No", "タイトル（推定）", "日付（推定）", "発出者", "施設タグ", "業務タグ", "状態", "理由・メモ", "概要（先頭900字）", "元ファイルパス"])
+    _style_header(ws1, [5, 38, 14, 14, 20, 24, 10, 22, 55, 42])
+
+    for idx, r in enumerate(records, 1):
+        if "err:" in r.method or r.method in ("error", "unhandled"):
+            state, fill = "❌エラー", ERR_FILL
+        elif r.needs_review:
+            state, fill = "⚠️要確認", REV_FILL
+        else:
+            state, fill = "✅OK", OK_FILL
+        ws1.append([
+            idx,
+            _xls_safe(r.title_guess), _xls_safe(r.date_guess), _xls_safe(r.issuer_guess),
+            " / ".join(r.tags_facility), " / ".join(r.tags_work),
+            state, _xls_safe(r.reason), _xls_safe(r.summary), _xls_safe(r.relpath),
+        ])
+        _style_row(ws1, idx + 1, fill)
+        ws1.row_dimensions[idx + 1].height = 55
+
+    # ─── Sheet 2: 要確認リスト ──────────────────────────────────────
+    ws2 = wb.create_sheet("② 要確認リスト")
+    rev_list = [r for r in records if r.needs_review]
+    ws2.append(["No", "タイトル（推定）", "理由・メモ", "抽出方式", "文字数", "元ファイルパス"])
+    _style_header(ws2, [5, 40, 30, 18, 8, 45])
+    if rev_list:
+        for idx, r in enumerate(rev_list, 1):
+            ws2.append([idx, _xls_safe(r.title_guess), _xls_safe(r.reason), r.method, r.text_chars, _xls_safe(r.relpath)])
+            _style_row(ws2, idx + 1, REV_FILL)
+    else:
+        ws2.append(["", "✅ 要確認ファイルはありません", "", "", "", ""])
+
     excel_path = os.path.join(outdir, "00_統合目次.xlsx")
     try:
         wb.save(excel_path)
@@ -266,10 +333,45 @@ def write_excel_index(outdir: str, records: List[Record]):
         raise PermissionError("00_統合目次.xlsx が他のアプリで開かれています。閉じてからやり直してください。")
 
 def write_md_indices(outdir: str, records: List[Record]):
+    ok_recs  = [r for r in records if not r.needs_review]
+    rev_recs = [r for r in records if r.needs_review]
+
     with open(os.path.join(outdir, "00_統合目次.md"), "w", encoding="utf-8") as f:
-        f.write("# 統合目次（概要付き）\n\n")
+        f.write("# 通知文書 統合目次\n\n")
+        f.write(f"> 処理ファイル総数: **{len(records)}件** | "
+                f"✅ 正常: **{len(ok_recs)}件** | "
+                f"⚠️ 要確認: **{len(rev_recs)}件**\n\n")
+        f.write("---\n\n")
+
+        # ── 正常ファイル一覧（表形式）────────────────────────────────
+        f.write("## ✅ 正常処理ファイル一覧\n\n")
+        f.write("| No | タイトル（推定） | 日付（推定） | 発出者 | 施設タグ | 業務タグ |\n")
+        f.write("|---|---|---|---|---|---|\n")
+        for i, r in enumerate(ok_recs, 1):
+            title = r.title_guess.replace("|", "｜").replace("\n", " ")[:60]
+            f.write(f"| {i} | {title} | {r.date_guess} | {r.issuer_guess} "
+                    f"| {' / '.join(r.tags_facility)} | {' / '.join(r.tags_work)} |\n")
+
+        # ── 要確認ファイル一覧 ────────────────────────────────────
+        if rev_recs:
+            f.write("\n---\n\n## ⚠️ 要確認ファイル一覧\n\n")
+            f.write("| No | ファイル名 | 理由 | 抽出方式 |\n")
+            f.write("|---|---|---|---|\n")
+            for i, r in enumerate(rev_recs, 1):
+                fn = os.path.basename(r.relpath).replace("|", "｜")
+                f.write(f"| {i} | {fn} | {r.reason} | {r.method} |\n")
+
+        # ── 概要一覧（NotebookLM読み込み用）────────────────────────
+        f.write("\n---\n\n## 各ファイル概要（NotebookLM用）\n\n")
         for r in records:
-            f.write(f"- **{r.title_guess}**\n  - 日付: {r.date_guess} / 発出: {r.issuer_guess}\n  - タグ: [{'/'.join(r.tags_facility)}] [{'/'.join(r.tags_work)}]\n  - 概要: {r.summary}\n  - 元: `{r.relpath}`\n\n")
+            title = r.title_guess.replace("\n", " ")
+            f.write(f"### {title}\n\n")
+            f.write(f"- **日付**: {r.date_guess}\n")
+            f.write(f"- **発出者**: {r.issuer_guess}\n")
+            f.write(f"- **施設タグ**: {' / '.join(r.tags_facility)}\n")
+            f.write(f"- **業務タグ**: {' / '.join(r.tags_work)}\n")
+            f.write(f"- **元ファイル**: `{r.relpath}`\n\n")
+            f.write(f"> {r.summary}\n\n")
 
 def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
     chunk_idx = 1
