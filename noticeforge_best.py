@@ -242,6 +242,14 @@ def make_summary(main_text: str, n: int) -> str:
     s = re.sub(r"\s+", " ", main_text.strip())
     return s[:n] + ("…" if len(s) > n else "")
 
+_ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+def _xls_safe(s) -> str:
+    """Excelに書き込めない制御文字を除去する"""
+    if not isinstance(s, str):
+        return s
+    return _ILLEGAL_CHARS_RE.sub("", s)
+
 def write_excel_index(outdir: str, records: List[Record]):
     if not openpyxl: return
     wb = openpyxl.Workbook()
@@ -249,7 +257,7 @@ def write_excel_index(outdir: str, records: List[Record]):
     ws.title = "Index"
     ws.append(["タイトル(推定)", "日付(推定)", "発出者(推定)", "施設タグ", "業務タグ", "needs_review", "理由", "概要(先頭)", "元ファイル"])
     for r in records:
-        ws.append([r.title_guess, r.date_guess, r.issuer_guess, " / ".join(r.tags_facility), " / ".join(r.tags_work), "TRUE" if r.needs_review else "FALSE", r.reason, r.summary, r.relpath])
+        ws.append([_xls_safe(r.title_guess), _xls_safe(r.date_guess), _xls_safe(r.issuer_guess), " / ".join(r.tags_facility), " / ".join(r.tags_work), "TRUE" if r.needs_review else "FALSE", _xls_safe(r.reason), _xls_safe(r.summary), _xls_safe(r.relpath)])
     
     excel_path = os.path.join(outdir, "00_統合目次.xlsx")
     try:
