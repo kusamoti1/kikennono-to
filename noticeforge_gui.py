@@ -141,6 +141,18 @@ class App(ctk.CTk):
         self.out_entry.configure(state=state)
         self.chk_ocr.configure(state=state)
 
+    def pick_input(self):
+        p = filedialog.askdirectory(title="入力フォルダを選択")
+        if p:
+            self.input_dir.set(p)
+            if not self.output_dir.get():
+                self.output_dir.set(os.path.join(p, "output_noticeforge"))
+
+    def pick_output(self):
+        p = filedialog.askdirectory(title="出力フォルダを選択")
+        if p:
+            self.output_dir.set(p)
+
     def start(self):
         indir = self.input_dir.get()
         outdir = self.output_dir.get()
