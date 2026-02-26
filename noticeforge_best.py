@@ -7,19 +7,36 @@ import os, sys, re, json, time, hashlib, csv, subprocess, html as _html
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional, Callable
 
-# Tesseractの設定 (Windowsの一般的なパス)
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# Tesseract バイナリの候補パス（複数のインストール場所に対応）
+_TESSERACT_CANDIDATES = [
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    r"C:\Users\Public\Tesseract-OCR\tesseract.exe",
+]
 
 try:
     import fitz  # PyMuPDF
 except Exception:
     fitz = None
 
+TESSERACT_AVAILABLE = False
 try:
     import pytesseract
     from PIL import Image
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-    TESSERACT_AVAILABLE = True
+    # バイナリを自動検出（インストール場所が異なる環境に対応）
+    _found_tesseract: Optional[str] = None
+    for _tc in _TESSERACT_CANDIDATES:
+        if os.path.isfile(_tc):
+            _found_tesseract = _tc
+            break
+    if _found_tesseract is None:
+        # PATH上にある場合（Linux / Mac / PATH追加済みのWindows）
+        import shutil as _shutil
+        if _shutil.which("tesseract"):
+            _found_tesseract = "tesseract"
+    if _found_tesseract:
+        pytesseract.pytesseract.tesseract_cmd = _found_tesseract
+        TESSERACT_AVAILABLE = True
 except Exception:
     TESSERACT_AVAILABLE = False
 
@@ -53,11 +70,12 @@ _WIN_NO_CONSOLE: dict = (
 
 def _build_xdw2text_candidates() -> List[str]:
     """xdw2text.exeの候補パスを構築する。
-    Windowsレジストリを優先検索し、DocuWorksのインストール場所を自動検出する。"""
+    レジストリ自動検出 → Program Files全体スキャン → 固定パスの順で探す。
+    TokiwaWorks / DocuWorks Viewer / 任意のバージョンを自動検出できる。"""
     candidates: List[str] = ["xdw2text"]  # まずPATH上を探す
 
     if sys.platform.startswith("win"):
-        # Windowsレジストリを検索してインストールパスを自動検出
+        # ── 方法①: Windowsレジストリを検索してインストールパスを自動検出 ──
         try:
             import winreg
             reg_keys = [
@@ -67,26 +85,52 @@ def _build_xdw2text_candidates() -> List[str]:
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\FUJIFILM\DocuWorks"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fujitsu\DocuWorks"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fujitsu\DocuWorks"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\TokiwaWorks\TokiwaWorks"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\TokiwaWorks\TokiwaWorks"),
                 (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Fuji Xerox\DocuWorks"),
                 (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\FUJIFILM\DocuWorks"),
+                (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\TokiwaWorks\TokiwaWorks"),
             ]
             for hive, key_path in reg_keys:
                 try:
                     key = winreg.OpenKey(hive, key_path)
-                    install_path, _ = winreg.QueryValueEx(key, "InstallPath")
-                    exe = os.path.join(str(install_path), "xdw2text.exe")
-                    if os.path.isfile(exe) and exe not in candidates:
-                        candidates.insert(1, exe)  # PATH の次に最優先で挿入
+                    for value_name in ("InstallPath", "Path", "Install_Dir", ""):
+                        try:
+                            install_path, _ = winreg.QueryValueEx(key, value_name)
+                            exe = os.path.join(str(install_path), "xdw2text.exe")
+                            if os.path.isfile(exe) and exe not in candidates:
+                                candidates.insert(1, exe)
+                        except Exception:
+                            continue
                 except Exception:
                     continue
         except Exception:
             pass
-        # フォールバック: 一般的な固定インストールパス
+
+        # ── 方法②: C:\Program Files 以下を glob で自動スキャン ──
+        # TokiwaWorks / DocuWorks Viewer など任意のインストール先を検出できる
+        try:
+            import glob as _glob
+            for pattern in [
+                r"C:\Program Files\*\xdw2text.exe",
+                r"C:\Program Files (x86)\*\xdw2text.exe",
+                r"C:\Program Files\*\*\xdw2text.exe",
+                r"C:\Program Files (x86)\*\*\xdw2text.exe",
+            ]:
+                for found in _glob.glob(pattern):
+                    if found not in candidates:
+                        candidates.insert(1, found)
+        except Exception:
+            pass
+
+        # ── 方法③: 固定パス（フォールバック） ──
         candidates += [
             r"C:\Program Files\Fuji Xerox\DocuWorks\xdw2text.exe",
             r"C:\Program Files (x86)\Fuji Xerox\DocuWorks\xdw2text.exe",
             r"C:\Program Files\FUJIFILM\DocuWorks\xdw2text.exe",
             r"C:\Program Files (x86)\FUJIFILM\DocuWorks\xdw2text.exe",
+            r"C:\Program Files\TokiwaWorks\xdw2text.exe",
+            r"C:\Program Files (x86)\TokiwaWorks\xdw2text.exe",
             r"C:\Program Files\DocuWorks\xdw2text.exe",
             r"C:\Program Files (x86)\DocuWorks\xdw2text.exe",
         ]
