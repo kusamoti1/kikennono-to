@@ -149,7 +149,13 @@ def extract_docx(path: str) -> Tuple[str, str]:
     if not Document: return "", "docx_missing"
     try:
         doc = Document(get_safe_path(path))
-        return "\n".join([p.text for p in doc.paragraphs if p.text]), "docx_text"
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                if any(cells):
+                    parts.append("| " + " | ".join(cells) + " |")
+        return "\n".join(parts), "docx_text"
     except Exception as e:
         return "", f"docx_err:{e.__class__.__name__}"
 
@@ -335,6 +341,44 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
         current_size += b_len
     flush()
 
+def compute_sha1(path: str) -> str:
+    """ファイルのSHA1ハッシュを計算して重複ファイル検出に使う"""
+    h = hashlib.sha1()
+    try:
+        with open(get_safe_path(path), "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+def extract_txt(path: str) -> Tuple[str, str]:
+    """プレーンテキストファイルを読み込む（文字コードを自動判定）"""
+    for enc in ("utf-8-sig", "cp932", "utf-8", "latin-1"):
+        try:
+            with open(get_safe_path(path), "r", encoding=enc, errors="ignore") as f:
+                return f.read(), "txt_read"
+        except Exception:
+            continue
+    return "", "txt_err"
+
+def extract_csv(path: str) -> Tuple[str, str]:
+    """CSVファイルをMarkdown表形式に整形する"""
+    for enc in ("utf-8-sig", "cp932", "utf-8"):
+        try:
+            with open(get_safe_path(path), "r", encoding=enc, newline="", errors="ignore") as f:
+                rows = list(csv.reader(f))
+            if not rows:
+                return "", "csv_empty"
+            out = []
+            for row in rows[:400]:
+                if any(c.strip() for c in row):
+                    out.append("| " + " | ".join([c.strip().replace("\n", " ") for c in row]) + " |")
+            return "\n".join(out), "csv_md"
+        except Exception:
+            continue
+    return "", "csv_err"
+
 def write_html_report(outdir: str, records: List[Record]):
     """人間が見やすいHTMLレポートを生成する（ブラウザで開くだけでOK）"""
     def esc(s: object) -> str:
@@ -513,8 +557,20 @@ window.addEventListener('load', function() {{
         f.write(html_content)
 
 
-def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_callback: Optional[Callable[[int, int, str, str], None]] = None) -> Tuple[int, int]:
+def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_callback: Optional[Callable[[int, int, str, str], None]] = None) -> Tuple[int, int, str]:
     os.makedirs(outdir, exist_ok=True)
+
+    # ① 前回の生成ファイルを削除（古いデータがNotebookLMに混入しないように）
+    for fname in os.listdir(outdir):
+        if fname.startswith("NotebookLM用_統合データ_") and fname.endswith(".txt"):
+            try: os.remove(os.path.join(outdir, fname))
+            except Exception: pass
+    for fname in ("00_統合目次.md", "00_統合目次.xlsx", "00_人間用レポート.html", "00_処理ログ.txt"):
+        p = os.path.join(outdir, fname)
+        if os.path.exists(p):
+            try: os.remove(p)
+            except Exception: pass
+
     max_depth = int(cfg.get("max_depth", 30))
     split_kws = list(cfg.get("main_attach_split_keywords", []))
     min_chars = int(cfg.get("min_chars_mainbody", 800))
@@ -532,18 +588,42 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         for fn in files
         if fn.lower() not in SKIP_FILENAMES
         and os.path.splitext(fn)[1].lower() not in SKIP_EXTENSIONS
-        and not fn.startswith("~$")  # Officeの一時ロックファイルを除外
+        and not fn.startswith("~$")
     ]
     total_files = len(targets)
     records: List[Record] = []
+
+    # ④ SHA1 重複検出用
+    seen_sha1: set = set()
+    skipped_dup = 0
+
+    # ⑥ 処理ログ
+    log_lines: List[str] = [
+        "=== NoticeForge 処理ログ ===",
+        f"処理日時: {time.strftime('%Y年%m月%d日 %H:%M:%S')}",
+        f"入力フォルダ: {indir}",
+        f"出力フォルダ: {outdir}",
+        "",
+        "--- 各ファイルの処理結果 ---",
+    ]
 
     for i, path in enumerate(targets):
         rel = os.path.relpath(path, indir)
         ext = os.path.splitext(path)[1].lower()
         if progress_callback: progress_callback(i + 1, total_files, rel, "(抽出中...)")
 
+        # ④ SHA1 重複チェック
+        sha1 = compute_sha1(path)
+        if sha1 and sha1 in seen_sha1:
+            if progress_callback: progress_callback(i + 1, total_files, rel, "(重複ファイル・スキップ)")
+            log_lines.append(f"[重複スキップ] {rel}")
+            skipped_dup += 1
+            continue
+        if sha1:
+            seen_sha1.add(sha1)
+
         text, method, reason, pages = "", "unhandled", "", None
-        
+
         try:
             if ext == ".pdf":
                 if use_ocr and progress_callback: progress_callback(i + 1, total_files, rel, "(OCR処理中...時間がかかります)")
@@ -554,6 +634,10 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
                 text, method = extract_excel(path)
             elif ext in (".xdw", ".xbd"):
                 text, method = extract_xdw(path)
+            elif ext == ".txt":                          # ③ .txt 対応
+                text, method = extract_txt(path)
+            elif ext == ".csv":                          # ③ .csv 対応
+                text, method = extract_csv(path)
         except Exception as e:
             method, reason = "error", f"抽出エラー: {e.__class__.__name__}"
 
@@ -573,11 +657,40 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         payload = f"タイトル(推定): {title}\n日付(推定): {date_guess}\n発出者(推定): {issuer_guess}\n\n# 本文\n{main.strip()}"
         if attach.strip(): payload += f"\n\n# 添付資料\n{attach.strip()}"
 
-        records.append(Record(relpath=rel, ext=ext, size=os.path.getsize(get_safe_path(path)), mtime=os.path.getmtime(get_safe_path(path)), sha1="", method=method, pages=pages, text_chars=len(text), needs_review=needs_rev, reason=reason, title_guess=title, date_guess=date_guess, issuer_guess=issuer_guess, summary=summary, tags_facility=fac, tags_work=work, tag_evidence=ev, out_txt="", full_text_for_bind=payload))
+        log_lines.append(f"[{method}] {rel}")
+        if reason:
+            log_lines.append(f"  → {reason}")
+
+        records.append(Record(relpath=rel, ext=ext, size=os.path.getsize(get_safe_path(path)), mtime=os.path.getmtime(get_safe_path(path)), sha1=sha1, method=method, pages=pages, text_chars=len(text), needs_review=needs_rev, reason=reason, title_guess=title, date_guess=date_guess, issuer_guess=issuer_guess, summary=summary, tags_facility=fac, tags_work=work, tag_evidence=ev, out_txt="", full_text_for_bind=payload))
 
     write_excel_index(outdir, records)
     write_md_indices(outdir, records)
     write_binded_texts(outdir, records, limit_bytes)
     write_html_report(outdir, records)
 
-    return len(records), len([r for r in records if r.needs_review])
+    # ⑥ サマリーを集計してログファイルに保存
+    needs_rev_count = len([r for r in records if r.needs_review])
+    review_breakdown: Dict[str, int] = {}
+    for r in records:
+        if r.needs_review:
+            key = r.method if ("missing" in r.method or r.method in ("unhandled", "error")) else "本文が短すぎる"
+            review_breakdown[key] = review_breakdown.get(key, 0) + 1
+
+    log_lines += [
+        "",
+        "--- サマリー ---",
+        f"総処理数: {len(records)} 件",
+        f"正常抽出: {len(records) - needs_rev_count} 件",
+        f"要確認: {needs_rev_count} 件",
+    ]
+    for k, v in sorted(review_breakdown.items(), key=lambda x: -x[1]):
+        log_lines.append(f"  ・{k}: {v} 件")
+    if skipped_dup:
+        log_lines.append(f"重複スキップ: {skipped_dup} 件")
+
+    with open(os.path.join(outdir, "00_処理ログ.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(log_lines))
+
+    # ⑥ GUI に渡す内訳文字列
+    breakdown_str = "　".join(f"{k}: {v}件" for k, v in sorted(review_breakdown.items(), key=lambda x: -x[1]))
+    return len(records), needs_rev_count, breakdown_str

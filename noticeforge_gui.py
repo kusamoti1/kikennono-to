@@ -190,8 +190,9 @@ class App(ctk.CTk):
 
             cfg = dict(core.DEFAULTS)
             cfg["use_ocr"] = do_ocr
-            total, needs = core.process_folder(indir, outdir, cfg, cb)
-            msg = f"完了しました。総数: {total} / 要確認: {needs}\nNotebookLM用の結合データを作成しました。"
+            total, needs, detail = core.process_folder(indir, outdir, cfg, cb)
+            detail_msg = f"\n内訳: {detail}" if detail else ""
+            msg = f"完了しました。総数: {total} / 要確認: {needs}{detail_msg}\nNotebookLM用データを作成しました。詳細は 00_処理ログ.txt で確認できます。"
             self.after(0, lambda: self._done(msg, False, outdir))
         except PermissionError as pe:
             self.after(0, lambda: self._done(str(pe), True, outdir))
