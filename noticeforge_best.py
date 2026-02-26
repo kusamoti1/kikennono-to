@@ -46,16 +46,56 @@ try:
 except Exception:
     XDWLIB_AVAILABLE = False
 
-# xdw2text.exe の候補パス（DocuWorksの一般的なインストール先を網羅）
-XDW2TEXT_CANDIDATES = [
-    "xdw2text",  # PATH上にある場合
-    r"C:\Program Files\Fuji Xerox\DocuWorks\xdw2text.exe",
-    r"C:\Program Files (x86)\Fuji Xerox\DocuWorks\xdw2text.exe",
-    r"C:\Program Files\FUJIFILM\DocuWorks\xdw2text.exe",
-    r"C:\Program Files (x86)\FUJIFILM\DocuWorks\xdw2text.exe",
-    r"C:\Program Files\DocuWorks\xdw2text.exe",
-    r"C:\Program Files (x86)\DocuWorks\xdw2text.exe",
-]
+# Windowsでサブプロセス実行時にコンソールウィンドウを表示しない設定
+_WIN_NO_CONSOLE: dict = (
+    {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}
+)
+
+def _build_xdw2text_candidates() -> List[str]:
+    """xdw2text.exeの候補パスを構築する。
+    Windowsレジストリを優先検索し、DocuWorksのインストール場所を自動検出する。"""
+    candidates: List[str] = ["xdw2text"]  # まずPATH上を探す
+
+    if sys.platform.startswith("win"):
+        # Windowsレジストリを検索してインストールパスを自動検出
+        try:
+            import winreg
+            reg_keys = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fuji Xerox\DocuWorks"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\FUJIFILM\DocuWorks"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fujitsu\DocuWorks"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fujitsu\DocuWorks"),
+                (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Fuji Xerox\DocuWorks"),
+                (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\FUJIFILM\DocuWorks"),
+            ]
+            for hive, key_path in reg_keys:
+                try:
+                    key = winreg.OpenKey(hive, key_path)
+                    install_path, _ = winreg.QueryValueEx(key, "InstallPath")
+                    exe = os.path.join(str(install_path), "xdw2text.exe")
+                    if os.path.isfile(exe) and exe not in candidates:
+                        candidates.insert(1, exe)  # PATH の次に最優先で挿入
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # フォールバック: 一般的な固定インストールパス
+        candidates += [
+            r"C:\Program Files\Fuji Xerox\DocuWorks\xdw2text.exe",
+            r"C:\Program Files (x86)\Fuji Xerox\DocuWorks\xdw2text.exe",
+            r"C:\Program Files\FUJIFILM\DocuWorks\xdw2text.exe",
+            r"C:\Program Files (x86)\FUJIFILM\DocuWorks\xdw2text.exe",
+            r"C:\Program Files\DocuWorks\xdw2text.exe",
+            r"C:\Program Files (x86)\DocuWorks\xdw2text.exe",
+        ]
+    return candidates
+
+# 起動時に候補リストを構築（レジストリも参照）
+XDW2TEXT_CANDIDATES = _build_xdw2text_candidates()
+# 一度見つかった実行ファイルのパスをキャッシュ（ファイルごとに7回試行しなくて済む）
+_XDW2TEXT_PATH: Optional[str] = None
 
 DEFAULTS: Dict[str, object] = {
     "min_chars_mainbody": 400, # 基準を少し甘くして抽出漏れを防止
@@ -192,17 +232,17 @@ def extract_excel(path: str) -> Tuple[str, str]:
         return "", f"excel_err:{e.__class__.__name__}"
 
 def extract_xdw(path: str) -> Tuple[str, str]:
-    """DocuWorksから直接テキストを抽出（xdwlib優先、次にxdw2text複数パス試行）"""
+    """DocuWorksからテキストを抽出する。
+    xdwlib（Pythonバインディング）を優先し、次にxdw2text.exeを試みる。
+    コンソールウィンドウは一切表示しない。"""
+    global _XDW2TEXT_PATH
     safe_p = get_safe_path(path)
 
     # 方法1: xdwlib（Python製DocuWorksバインディング）を優先的に試す
     if XDWLIB_AVAILABLE:
         try:
             doc = xdwlib.xdwopen(path)
-            texts = []
-            for pg in range(doc.pages):
-                page = doc[pg]
-                texts.append(page.text)
+            texts = [doc[pg].text for pg in range(doc.pages)]
             doc.close()
             result = "\n".join(texts)
             if result.strip():
@@ -210,19 +250,33 @@ def extract_xdw(path: str) -> Tuple[str, str]:
         except Exception:
             pass  # 失敗したらxdw2textにフォールバック
 
-    # 方法2: xdw2text.exe を複数の候補パスで試す
-    for cmd in XDW2TEXT_CANDIDATES:
+    # 方法2: xdw2text.exe を試す
+    # 一度見つかったパスをキャッシュ済みなら1回だけ試す（ウィンドウ多発を防止）
+    # まだ見つかっていない場合は全候補を順に試す
+    candidates_to_try = [_XDW2TEXT_PATH] if _XDW2TEXT_PATH else XDW2TEXT_CANDIDATES
+
+    for cmd in candidates_to_try:
+        if not cmd:
+            continue
         try:
             result = subprocess.run(
                 [cmd, safe_p],
-                capture_output=True, text=True,
-                encoding="cp932", errors="ignore",
-                timeout=30
+                capture_output=True,
+                text=True,
+                encoding="cp932",
+                errors="ignore",
+                timeout=30,
+                **_WIN_NO_CONSOLE,   # ← Windowsのコンソールウィンドウを非表示
             )
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout, "xdw_text"
+            if result.returncode == 0:
+                _XDW2TEXT_PATH = cmd  # 使えるexeを記憶して次回以降の探索を省略
+                if result.stdout.strip():
+                    return result.stdout, "xdw_text"
+                return "", "xdw_empty_or_protected"  # ツールは動いたがファイルが空
         except FileNotFoundError:
-            continue  # このパスにはexeがないので次を試す
+            if cmd == _XDW2TEXT_PATH:
+                _XDW2TEXT_PATH = None  # キャッシュが無効になったのでリセット
+            continue
         except Exception:
             continue
 
