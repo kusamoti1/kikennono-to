@@ -256,10 +256,37 @@ def convert_japanese_year(text: str) -> str:
         return f"{match.group(0)}（{west_year}年）"
     return re.sub(r"(令和|平成|昭和)\s*([0-9元]+)\s*年", replacer, text)
 
+# 通知タイトルの典型的な末尾パターン（日本の公文書）
+_TITLE_ENDINGS = (
+    r"について[（(]?通知[）)]?\s*$", r"について\s*$", r"に関する件\s*$",
+    r"に関して\s*$", r"に係る件\s*$", r"の件\s*$",
+)
+# ヘッダー行の典型パターン（文書番号・日付・宛先・発出者など）
+_HEADER_PATTERNS = (
+    r"^第\d+号", r"^[消総危]防[予施立]?第", r"^\d{4}年", r"^令和|^平成|^昭和",
+    r"各都道府県|各消防本部|各市町村", r"殿\s*$", r"御中\s*$",
+    r"^消防庁|^総務省|^危険物保安室|^予防課", r"官印省略",
+)
+
 def guess_title(text: str, fallback: str) -> str:
-    for l in text.splitlines()[:50]:
-        s = l.strip()
-        if 6 <= len(s) <= 120 and not re.match(r"^[\d\-\s\(\)]+$", s): return s
+    """通知タイトルを推定する（「〜について」パターンを優先、ヘッダー行はスキップ）"""
+    lines = text.splitlines()
+    # パターン1: 「〜について」「〜に関する件」で終わる行を優先（通知タイトルの典型形）
+    for line in lines[:100]:
+        s = line.strip()
+        if 10 <= len(s) <= 150:
+            if any(re.search(pat, s) for pat in _TITLE_ENDINGS):
+                return s
+    # パターン2: ヘッダー行をスキップして最初の意味のある行を取る
+    for line in lines[:80]:
+        s = line.strip()
+        if len(s) < 8 or len(s) > 150:
+            continue
+        if re.match(r"^[\d\-\s\(\)（）・ 　]+$", s):
+            continue
+        if any(re.search(p, s) for p in _HEADER_PATTERNS):
+            continue
+        return s
     return fallback
 
 def guess_date(text: str) -> str:
@@ -286,7 +313,23 @@ def tag_text(text: str) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
     return fac, work, ev
 
 def make_summary(main_text: str, n: int) -> str:
-    s = re.sub(r"\s+", " ", main_text.strip())
+    """通知の概要を生成する（ヘッダーをスキップして本文の要点を抽出）"""
+    # 「記」以降があればその内容を優先（日本の公文書では「記」が本文の始まりを示す）
+    ki_match = re.search(r"\n\s*記\s*\n", main_text)
+    if ki_match:
+        core = main_text[ki_match.end():]
+        s = re.sub(r"\s+", " ", core.strip())
+        return s[:n] + ("…" if len(s) > n else "")
+    # タイトル行（「〜について」等）以降を本文として使う
+    lines = main_text.splitlines()
+    start = 0
+    for i, line in enumerate(lines[:80]):
+        s = line.strip()
+        if re.search(r"について|に関する|に関して|に係る", s) and 10 <= len(s) <= 200:
+            start = i + 1
+            break
+    core = "\n".join(lines[start:])
+    s = re.sub(r"\s+", " ", core.strip())
     return s[:n] + ("…" if len(s) > n else "")
 
 _ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -321,23 +364,43 @@ def write_md_indices(outdir: str, records: List[Record]):
 def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
     chunk_idx = 1
     current_size = 0
-    current_lines = []
-    
+    current_blocks: List[str] = []
+    current_toc: List[str] = []
+    doc_num = 0
+
     def flush():
-        nonlocal chunk_idx, current_size, current_lines
-        if not current_lines: return
+        nonlocal chunk_idx, current_size, current_blocks, current_toc
+        if not current_blocks: return
+        toc_header = (
+            "【このファイルの収録文書一覧】\n"
+            + "\n".join(current_toc)
+            + f"\n（以上 {len(current_toc)} 件）\n\n" + "=" * 60 + "\n"
+        )
         with open(os.path.join(outdir, f"NotebookLM用_統合データ_{chunk_idx:02d}.txt"), "w", encoding="utf-8") as f:
-            f.write("\n".join(current_lines))
+            f.write(toc_header + "\n".join(current_blocks))
         chunk_idx += 1
         current_size = 0
-        current_lines = []
+        current_blocks = []
+        current_toc = []
 
     for r in records:
         if not r.full_text_for_bind.strip(): continue
-        block = f"\n\n{'='*60}\n【DOCUMENT START】\n元ファイル: {r.relpath}\n抽出方式: {r.method}\n{'-'*60}\n{r.full_text_for_bind}\n{'='*60}\n\n"
+        doc_num += 1
+        toc_entry = f"  {doc_num:3d}. {r.title_guess}（{r.date_guess or '日付不明'}）"
+        block = (
+            f"\n\n{'='*60}\n"
+            f"【文書 No.{doc_num}】\n"
+            f"元ファイル: {r.relpath}\n"
+            f"タイトル: {r.title_guess}\n"
+            f"日付: {r.date_guess or '不明'} / 発出: {r.issuer_guess or '不明'}\n"
+            f"{'-'*60}\n"
+            f"{r.full_text_for_bind}\n"
+            f"{'='*60}\n\n"
+        )
         b_len = len(block.encode("utf-8"))
         if current_size + b_len > limit_bytes and current_size > 0: flush()
-        current_lines.append(block)
+        current_blocks.append(block)
+        current_toc.append(toc_entry)
         current_size += b_len
     flush()
 
@@ -559,8 +622,10 @@ window.addEventListener('load', function() {{
 
 def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_callback: Optional[Callable[[int, int, str, str], None]] = None) -> Tuple[int, int, str]:
     os.makedirs(outdir, exist_ok=True)
+    outdir_abs = os.path.abspath(outdir)
 
-    # ① 前回の生成ファイルを削除（古いデータがNotebookLMに混入しないように）
+    # 前回の生成ファイルを削除（古いデータがNotebookLMに混入しないように）
+    # ※ 00_manifest.json だけは差分処理のために残す
     for fname in os.listdir(outdir):
         if fname.startswith("NotebookLM用_統合データ_") and fname.endswith(".txt"):
             try: os.remove(os.path.join(outdir, fname))
@@ -573,36 +638,56 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
 
     max_depth = int(cfg.get("max_depth", 30))
     split_kws = list(cfg.get("main_attach_split_keywords", []))
-    min_chars = int(cfg.get("min_chars_mainbody", 800))
+    min_chars = int(cfg.get("min_chars_mainbody", 400))
     use_ocr = bool(cfg.get("use_ocr", False))
     limit_bytes = int(cfg.get("bind_bytes_limit", 15000000))
 
-    # システムファイル・一時ファイルを除外するフィルター
     SKIP_FILENAMES = frozenset({"thumbs.db", "desktop.ini", ".ds_store"})
     SKIP_EXTENSIONS = frozenset({".db", ".tmp", ".bak", ".lnk", ".ini", ".cache"})
 
-    targets = [
-        os.path.join(root, fn)
-        for root, _, files in os.walk(indir)
-        if os.path.relpath(root, indir).count(os.sep) < max_depth
-        for fn in files
-        if fn.lower() not in SKIP_FILENAMES
-        and os.path.splitext(fn)[1].lower() not in SKIP_EXTENSIONS
-        and not fn.startswith("~$")
-    ]
+    # 【バグ修正】出力フォルダが入力フォルダ内にある場合、スキャン対象から除外する
+    targets: List[str] = []
+    for root, dirs, files in os.walk(indir):
+        # 出力フォルダのサブツリーを丸ごとスキップ（dirs を in-place 変更）
+        dirs[:] = [
+            d for d in dirs
+            if os.path.abspath(os.path.join(root, d)) != outdir_abs
+        ]
+        # 深さ制限
+        rel_root = os.path.relpath(root, indir)
+        depth = 0 if rel_root == "." else rel_root.count(os.sep) + 1
+        if depth >= max_depth:
+            dirs.clear()
+            continue
+        for fn in files:
+            if fn.lower() in SKIP_FILENAMES: continue
+            if os.path.splitext(fn)[1].lower() in SKIP_EXTENSIONS: continue
+            if fn.startswith("~$"): continue
+            targets.append(os.path.join(root, fn))
+
     total_files = len(targets)
     records: List[Record] = []
-
-    # ④ SHA1 重複検出用
     seen_sha1: set = set()
     skipped_dup = 0
+    skipped_cache = 0
 
-    # ⑥ 処理ログ
+    # マニフェスト（処理キャッシュ）を読み込む
+    # → 変更のないファイルは再処理をスキップし、前回結果を再利用する
+    manifest_path = os.path.join(outdir, "00_manifest.json")
+    manifest: Dict[str, dict] = {}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception:
+            manifest = {}
+
     log_lines: List[str] = [
         "=== NoticeForge 処理ログ ===",
         f"処理日時: {time.strftime('%Y年%m月%d日 %H:%M:%S')}",
         f"入力フォルダ: {indir}",
         f"出力フォルダ: {outdir}",
+        f"キャッシュ読込: {len(manifest)} 件",
         "",
         "--- 各ファイルの処理結果 ---",
     ]
@@ -610,17 +695,33 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     for i, path in enumerate(targets):
         rel = os.path.relpath(path, indir)
         ext = os.path.splitext(path)[1].lower()
-        if progress_callback: progress_callback(i + 1, total_files, rel, "(抽出中...)")
+        if progress_callback: progress_callback(i + 1, total_files, rel, "(確認中...)")
 
-        # ④ SHA1 重複チェック
         sha1 = compute_sha1(path)
+
+        # 重複ファイルチェック
         if sha1 and sha1 in seen_sha1:
-            if progress_callback: progress_callback(i + 1, total_files, rel, "(重複ファイル・スキップ)")
+            if progress_callback: progress_callback(i + 1, total_files, rel, "(重複・スキップ)")
             log_lines.append(f"[重複スキップ] {rel}")
             skipped_dup += 1
             continue
-        if sha1:
-            seen_sha1.add(sha1)
+
+        # キャッシュヒットチェック（SHA1が一致 → 内容変更なし → 前回結果を再利用）
+        if sha1 and sha1 in manifest:
+            try:
+                cached = manifest[sha1]
+                record = Record(**{**cached, "relpath": rel, "sha1": sha1})
+                records.append(record)
+                seen_sha1.add(sha1)
+                if progress_callback: progress_callback(i + 1, total_files, rel, "(キャッシュ使用)")
+                log_lines.append(f"[キャッシュ] {rel}")
+                skipped_cache += 1
+                continue
+            except Exception:
+                pass  # キャッシュが壊れていたら通常処理にフォールバック
+
+        seen_sha1.add(sha1)
+        if progress_callback: progress_callback(i + 1, total_files, rel, "(抽出中...)")
 
         text, method, reason, pages = "", "unhandled", "", None
 
@@ -634,9 +735,9 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
                 text, method = extract_excel(path)
             elif ext in (".xdw", ".xbd"):
                 text, method = extract_xdw(path)
-            elif ext == ".txt":                          # ③ .txt 対応
+            elif ext == ".txt":
                 text, method = extract_txt(path)
-            elif ext == ".csv":                          # ③ .csv 対応
+            elif ext == ".csv":
                 text, method = extract_csv(path)
         except Exception as e:
             method, reason = "error", f"抽出エラー: {e.__class__.__name__}"
@@ -661,14 +762,23 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         if reason:
             log_lines.append(f"  → {reason}")
 
-        records.append(Record(relpath=rel, ext=ext, size=os.path.getsize(get_safe_path(path)), mtime=os.path.getmtime(get_safe_path(path)), sha1=sha1, method=method, pages=pages, text_chars=len(text), needs_review=needs_rev, reason=reason, title_guess=title, date_guess=date_guess, issuer_guess=issuer_guess, summary=summary, tags_facility=fac, tags_work=work, tag_evidence=ev, out_txt="", full_text_for_bind=payload))
+        records.append(Record(
+            relpath=rel, ext=ext,
+            size=os.path.getsize(get_safe_path(path)),
+            mtime=os.path.getmtime(get_safe_path(path)),
+            sha1=sha1, method=method, pages=pages,
+            text_chars=len(text), needs_review=needs_rev, reason=reason,
+            title_guess=title, date_guess=date_guess, issuer_guess=issuer_guess,
+            summary=summary, tags_facility=fac, tags_work=work, tag_evidence=ev,
+            out_txt="", full_text_for_bind=payload,
+        ))
 
     write_excel_index(outdir, records)
     write_md_indices(outdir, records)
     write_binded_texts(outdir, records, limit_bytes)
     write_html_report(outdir, records)
 
-    # ⑥ サマリーを集計してログファイルに保存
+    # サマリーを集計してログファイルに保存
     needs_rev_count = len([r for r in records if r.needs_review])
     review_breakdown: Dict[str, int] = {}
     for r in records:
@@ -679,7 +789,7 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     log_lines += [
         "",
         "--- サマリー ---",
-        f"総処理数: {len(records)} 件",
+        f"総処理数: {len(records)} 件（うちキャッシュ利用: {skipped_cache} 件）",
         f"正常抽出: {len(records) - needs_rev_count} 件",
         f"要確認: {needs_rev_count} 件",
     ]
@@ -691,6 +801,16 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     with open(os.path.join(outdir, "00_処理ログ.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(log_lines))
 
-    # ⑥ GUI に渡す内訳文字列
+    # マニフェストを更新（次回の差分処理のために全レコードを保存）
+    manifest_new: Dict[str, dict] = {}
+    for r in records:
+        if r.sha1:
+            manifest_new[r.sha1] = asdict(r)
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest_new, f, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        pass  # マニフェスト保存失敗は致命的ではない
+
     breakdown_str = "　".join(f"{k}: {v}件" for k, v in sorted(review_breakdown.items(), key=lambda x: -x[1]))
     return len(records), needs_rev_count, breakdown_str
