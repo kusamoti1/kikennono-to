@@ -361,32 +361,35 @@ def extract_xdw(path: str) -> Tuple[str, str]:
             continue
 
     # 方法3: xdoc2txt.exe を試す（無料ツール: https://ebstudio.info/home/xdoc2txt.html）
+    # DocuWorks Viewer Light をインストールすると DocuWorks Content Filter (iFilter) が
+    # 自動インストールされるため、-i オプションで XDW からテキスト抽出できる。
     global _XDOC2TXT_PATH
     xdoc2txt_candidates = [_XDOC2TXT_PATH] if _XDOC2TXT_PATH else XDOC2TXT_CANDIDATES
     for cmd in xdoc2txt_candidates:
         if not cmd:
             continue
-        try:
-            result = subprocess.run(
-                [cmd, safe_p],
-                capture_output=True,
-                text=True,
-                encoding="cp932",
-                errors="ignore",
-                timeout=30,
-                **_WIN_NO_CONSOLE,
-            )
-            if result.returncode == 0:
-                _XDOC2TXT_PATH = cmd
-                if result.stdout.strip():
-                    return result.stdout, "xdw_xdoc2txt"
-                return "", "xdw_empty_or_protected"
-        except FileNotFoundError:
-            if cmd == _XDOC2TXT_PATH:
-                _XDOC2TXT_PATH = None
-            continue
-        except Exception:
-            continue
+        # まず -i (iFilter) オプションで試す → DocuWorks Viewer Light の iFilter を利用
+        for args in [[cmd, "-i", safe_p], [cmd, safe_p]]:
+            try:
+                result = subprocess.run(
+                    args,
+                    capture_output=True,
+                    text=True,
+                    encoding="cp932",
+                    errors="ignore",
+                    timeout=30,
+                    **_WIN_NO_CONSOLE,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    _XDOC2TXT_PATH = cmd
+                    method_name = "xdw_xdoc2txt_ifilter" if "-i" in args else "xdw_xdoc2txt"
+                    return result.stdout, method_name
+            except FileNotFoundError:
+                if cmd == _XDOC2TXT_PATH:
+                    _XDOC2TXT_PATH = None
+                break  # このcmdは存在しないので次のcmdへ
+            except Exception:
+                break
 
     return "", "xdw2text_missing (要xdw2text.exe または xdoc2txt.exe 導入: DocuWorksフォルダ内 または https://ebstudio.info/home/xdoc2txt.html)"
 
