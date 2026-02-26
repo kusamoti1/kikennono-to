@@ -15,13 +15,15 @@ except Exception as e:
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
-APP_TITLE = "NoticeForge v5.1（NotebookLM完全版・防弾仕様）"
+APP_TITLE = "NoticeForge v5.2（NotebookLM完全版・防弾仕様）"
 
 HELP_RIGHT = """ここだけ読めばOK
 
 【1】通知を入力フォルダに入れる。
-【2】画像PDFがある場合は
+【2】画像スキャンPDFがある場合のみ
 　　「OCRを実行」にチェック。
+　　※テキスト埋め込みPDFは自動で
+　　　テキスト読取するのでチェック不要
 【3】「処理開始」を押す。
 ※出力先は毎回リセットされます。
 ※Excelを開いたままだとエラーになるので
@@ -32,6 +34,11 @@ HELP_RIGHT = """ここだけ読めばOK
 ・ 00_統合目次.md
 ・ NotebookLM用_統合データ_〇〇.txt
 だけをNotebookLMに入れます。
+
+【途中で止めるには】
+「■ 止める」ボタンを押してください。
+現在のファイル処理が完了次第、
+処理を停止します。
 """
 
 class App(ctk.CTk):
@@ -46,6 +53,7 @@ class App(ctk.CTk):
         self.use_ocr = tk.BooleanVar(value=False)
 
         self._busy = False
+        self._stop_event: threading.Event = threading.Event()
         self._build_ui()
 
     def _build_ui(self):
@@ -55,7 +63,7 @@ class App(ctk.CTk):
 
         header = ctk.CTkFrame(self, corner_radius=0)
         header.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ctk.CTkLabel(header, text="NoticeForge v5.1", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(16, 4))
+        ctk.CTkLabel(header, text="NoticeForge v5.2", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(16, 4))
         ctk.CTkLabel(header, text="全ファイル対応（DocuWorks/新旧Excel/PDF）→ NotebookLM用データ自動生成", text_color="gray").pack(pady=(0, 16))
 
         main = ctk.CTkFrame(self, fg_color="transparent")
@@ -81,11 +89,30 @@ class App(ctk.CTk):
 
         opt_frame = ctk.CTkFrame(main, fg_color="transparent")
         opt_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        self.chk_ocr = ctk.CTkCheckBox(opt_frame, text="読めないPDFにOCR（画像文字認識）を実行する ※時間がかかります", variable=self.use_ocr, font=ctk.CTkFont(weight="bold"))
+        self.chk_ocr = ctk.CTkCheckBox(opt_frame, text="スキャンPDFにOCR（文字認識）を実行する ※テキスト埋め込みPDFは自動で通常読取", variable=self.use_ocr, font=ctk.CTkFont(weight="bold"))
         self.chk_ocr.pack(side="left", padx=12)
 
-        self.run_btn = ctk.CTkButton(main, text="③ 処理開始（出力先はリセットされます）", height=48, font=ctk.CTkFont(size=16, weight="bold"), command=self.start)
-        self.run_btn.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        # ③ 処理開始ボタン ＋ ■ 止めるボタン（横並び）
+        btn_row = ctk.CTkFrame(main, fg_color="transparent")
+        btn_row.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        btn_row.grid_columnconfigure(0, weight=3)
+        btn_row.grid_columnconfigure(1, weight=1)
+
+        self.run_btn = ctk.CTkButton(
+            btn_row, text="③ 処理開始（出力先はリセットされます）",
+            height=48, font=ctk.CTkFont(size=16, weight="bold"),
+            command=self.start
+        )
+        self.run_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        self.stop_btn = ctk.CTkButton(
+            btn_row, text="■ 止める",
+            height=48, font=ctk.CTkFont(size=14, weight="bold"),
+            command=self.stop_processing,
+            fg_color="#dc2626", hover_color="#b91c1c",
+            state="disabled"
+        )
+        self.stop_btn.grid(row=0, column=1, sticky="ew")
 
         st = ctk.CTkFrame(main)
         st.grid(row=3, column=0, sticky="nsew")
@@ -144,6 +171,18 @@ class App(ctk.CTk):
         self.in_entry.configure(state=state)
         self.out_entry.configure(state=state)
         self.chk_ocr.configure(state=state)
+        # 止めるボタンは処理中のみ有効
+        self.stop_btn.configure(
+            state="normal" if busy else "disabled",
+            text="■ 止める"
+        )
+
+    def stop_processing(self):
+        """処理停止リクエストを送る"""
+        self._stop_event.set()
+        self.stop_btn.configure(state="disabled", text="停止中…")
+        self.status.configure(text="停止リクエスト中… 現在のファイル処理が完了次第停止します。", text_color="#f59e0b")
+        self.append_log("[STOP] 停止リクエストを送信しました。")
 
     def pick_input(self):
         p = filedialog.askdirectory(title="入力フォルダを選択")
@@ -172,6 +211,7 @@ class App(ctk.CTk):
             return
 
         os.makedirs(outdir, exist_ok=True)
+        self._stop_event = threading.Event()  # 新しいイベントでリセット
         self.set_busy(True)
         self.open_out.configure(state="disabled")
         self.open_excel.configure(state="disabled")
@@ -179,21 +219,32 @@ class App(ctk.CTk):
         self.status.configure(text="開始準備中…", text_color="gray")
         self.append_log("=== 処理開始 ===")
 
-        t = threading.Thread(target=self._worker, args=(indir, outdir, self.use_ocr.get()), daemon=True)
+        t = threading.Thread(
+            target=self._worker,
+            args=(indir, outdir, self.use_ocr.get(), self._stop_event),
+            daemon=True
+        )
         t.start()
 
-    def _worker(self, indir: str, outdir: str, do_ocr: bool):
+    def _worker(self, indir: str, outdir: str, do_ocr: bool, stop_event: threading.Event):
         try:
             def cb(curr: int, total: int, fn: str, status_msg: str = ""):
+                if stop_event.is_set():
+                    return
                 msg = f"[{curr}/{total}] {fn} {status_msg}"
                 self.after(0, lambda: self._progress(curr, total, msg))
 
             cfg = dict(core.DEFAULTS)
             cfg["use_ocr"] = do_ocr
-            total, needs, detail = core.process_folder(indir, outdir, cfg, cb)
-            detail_msg = f"\n内訳: {detail}" if detail else ""
-            msg = f"完了しました。総数: {total} / 要確認: {needs}{detail_msg}\nNotebookLM用データを作成しました。詳細は 00_処理ログ.txt で確認できます。"
-            self.after(0, lambda: self._done(msg, False, outdir))
+            total, needs, detail = core.process_folder(indir, outdir, cfg, cb, stop_event)
+
+            if stop_event.is_set():
+                msg = f"処理を途中で停止しました。処理済み: {total}件 / 要確認: {needs}件\n途中結果はHTMLレポートで確認できます。"
+                self.after(0, lambda: self._done(msg, False, outdir, stopped=True))
+            else:
+                detail_msg = f"\n内訳: {detail}" if detail else ""
+                msg = f"完了しました。総数: {total} / 要確認: {needs}{detail_msg}\nNotebookLM用データを作成しました。詳細は 00_処理ログ.txt で確認できます。"
+                self.after(0, lambda: self._done(msg, False, outdir))
         except PermissionError as pe:
             self.after(0, lambda: self._done(str(pe), True, outdir))
         except Exception as e:
@@ -206,13 +257,21 @@ class App(ctk.CTk):
         self.status.configure(text=f"処理中… {msg}", text_color="gray")
         self.append_log(msg)
 
-    def _done(self, msg: str, is_error: bool, outdir: str):
+    def _done(self, msg: str, is_error: bool, outdir: str, stopped: bool = False):
         self.set_busy(False)
         if is_error:
             self.progress.set(0)
             self.status.configure(text=msg, text_color="#ff5555")
             self.append_log("[ERROR] " + msg)
             messagebox.showerror("処理失敗", msg)
+        elif stopped:
+            self.progress.set(0)
+            self.status.configure(text=msg, text_color="#f59e0b")
+            self.append_log("[STOPPED] " + msg)
+            self.open_out.configure(state="normal")
+            self.open_excel.configure(state="normal")
+            self.open_html.configure(state="normal")
+            messagebox.showinfo("停止しました", msg)
         else:
             self.progress.set(1)
             self.status.configure(text=msg, text_color="#00aa00")
