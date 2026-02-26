@@ -381,8 +381,16 @@ def write_html_report(outdir: str, records: List[Record]):
             if r.reason else ""
         )
 
+        # data-search に検索対象テキストを全部まとめる（小文字化はJS側で行う）
+        search_data = " ".join([
+            r.title_guess, r.summary, r.relpath,
+            r.date_guess, r.issuer_guess,
+            " ".join(r.tags_facility), " ".join(r.tags_work),
+            r.reason, r.method,
+        ]).replace('"', '')
+
         cards_html.append(f"""
-<div class="card {card_cls}">
+<div class="card {card_cls}" data-search="{esc(search_data.lower())}">
   <div class="card-header">
     <div class="card-title">{esc(r.title_guess)}</div>
     {rev_badge}
@@ -424,6 +432,13 @@ body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;backgrou
 .method-table tr:last-child td{{border-bottom:none}}
 /* ─── カード一覧 ─── */
 .container{{max-width:1080px;margin:24px auto;padding:0 16px}}
+/* ─── 検索バー ─── */
+.search-bar{{background:white;padding:12px 32px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:100;box-shadow:0 2px 6px rgba(0,0,0,.06)}}
+.search-input{{flex:1;max-width:680px;padding:10px 16px 10px 42px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;font-family:inherit;outline:none;transition:border-color .2s;background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' fill='none' stroke='%2394a3b8' stroke-width='2' viewBox='0 0 24 24'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.35-4.35'/%3E%3C/svg%3E") no-repeat 12px center}}
+.search-input:focus{{border-color:#2563eb}}
+.search-hint{{font-size:12px;color:#94a3b8}}
+.search-count{{font-size:13px;color:#64748b;font-weight:bold;white-space:nowrap}}
+.no-results{{text-align:center;padding:64px 16px;color:#94a3b8;font-size:15px;display:none}}
 .card{{background:white;border-radius:10px;padding:18px 22px;margin-bottom:14px;border-left:5px solid #94a3b8;box-shadow:0 1px 4px rgba(0,0,0,.07);transition:box-shadow .2s}}
 .card:hover{{box-shadow:0 3px 10px rgba(0,0,0,.12)}}
 .card-ok{{border-left-color:#16a34a}}
@@ -459,10 +474,38 @@ body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;backgrou
     {method_rows}
   </table>
 </div>
+<div class="search-bar">
+  <input class="search-input" id="searchInput" type="text"
+    placeholder="キーワードで絞り込む（タイトル・発出者・ファイル名など。NotebookLMの引用文をそのまま貼り付けてもOK）"
+    oninput="filterCards()">
+  <span class="search-hint">→ 元ファイルを素早く探せます</span>
+  <span class="search-count" id="searchCount"></span>
+</div>
 <div class="container">
 {''.join(cards_html)}
+  <div class="no-results" id="noResults">該当するファイルが見つかりませんでした。別のキーワードを試してください。</div>
 </div>
 <div class="footer">NoticeForge &mdash; NotebookLM 連携ツール</div>
+<script>
+function filterCards() {{
+  var q = document.getElementById('searchInput').value.toLowerCase();
+  var cards = document.querySelectorAll('.card');
+  var shown = 0;
+  cards.forEach(function(card) {{
+    var text = card.getAttribute('data-search');
+    var match = !q || text.includes(q);
+    card.style.display = match ? '' : 'none';
+    if (match) shown++;
+  }});
+  var countEl = document.getElementById('searchCount');
+  var noRes   = document.getElementById('noResults');
+  countEl.textContent = q ? (shown + ' 件 / ' + cards.length + ' 件中') : (cards.length + ' 件');
+  noRes.style.display = (q && shown === 0) ? 'block' : 'none';
+}}
+window.addEventListener('load', function() {{
+  document.getElementById('searchCount').textContent = document.querySelectorAll('.card').length + ' 件';
+}});
+</script>
 </body>
 </html>"""
 
