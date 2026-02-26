@@ -1432,9 +1432,11 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         f.write("\n".join(log_lines))
 
     # マニフェストを更新（次回の差分処理のために全レコードを保存）
+    # ※ needs_review=True のファイルはキャッシュに乗せない
+    #   → 次回OCRありで再処理したとき、⚠ファイルだけが自動的に再処理される
     manifest_new: Dict[str, dict] = {}
     for r in records:
-        if r.sha1:
+        if r.sha1 and not r.needs_review:
             manifest_new[r.sha1] = asdict(r)
     try:
         with open(manifest_path, "w", encoding="utf-8") as f:
