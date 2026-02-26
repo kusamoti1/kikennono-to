@@ -3,7 +3,7 @@
 NoticeForge Core Logic v5.0 (Ultimate: DocuWorks/Excel-MD/LongPath/Binder)
 """
 from __future__ import annotations
-import os, sys, re, json, time, hashlib, csv, subprocess
+import os, sys, re, json, time, hashlib, csv, subprocess, html as _html
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional, Callable
 
@@ -335,6 +335,141 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
         current_size += b_len
     flush()
 
+def write_html_report(outdir: str, records: List[Record]):
+    """人間が見やすいHTMLレポートを生成する（ブラウザで開くだけでOK）"""
+    def esc(s: object) -> str:
+        return _html.escape(str(s) if s is not None else "")
+
+    total = len(records)
+    ok_count = sum(1 for r in records if not r.needs_review)
+    needs_rev_count = total - ok_count
+
+    # 抽出方式ごとの集計
+    method_counts: Dict[str, int] = {}
+    for r in records:
+        method_counts[r.method] = method_counts.get(r.method, 0) + 1
+    method_rows = "".join(
+        f"<tr><td>{esc(m)}</td><td style='text-align:right'>{c}</td></tr>"
+        for m, c in sorted(method_counts.items(), key=lambda x: -x[1])
+    )
+
+    # 施設タグ・業務タグ用のバッジ色マップ
+    FAC_COLOR  = "#2563eb"
+    WORK_COLOR = "#16a34a"
+
+    def make_badge(text: str, color: str) -> str:
+        return f'<span class="badge" style="background:{color}">{esc(text)}</span>'
+
+    # ファイルカード生成
+    cards_html = []
+    for r in records:
+        card_cls  = "card-review" if r.needs_review else "card-ok"
+        rev_badge = '<span class="rev-badge">⚠ 要確認</span>' if r.needs_review else \
+                    '<span class="ok-badge">✓ 正常</span>'
+        fac_badges  = "".join(make_badge(t, FAC_COLOR)  for t in r.tags_facility)
+        work_badges = "".join(make_badge(t, WORK_COLOR) for t in r.tags_work)
+        tags_html   = (fac_badges + work_badges) or '<span style="color:#94a3b8;font-size:12px">タグなし</span>'
+
+        date_str   = esc(r.date_guess)   or "日付不明"
+        issuer_str = esc(r.issuer_guess) or "発出者不明"
+        pages_str  = f"/{r.pages}p" if r.pages else ""
+        method_str = esc(r.method)
+        size_kb    = f"{r.size // 1024:,} KB" if r.size >= 1024 else f"{r.size} B"
+
+        reason_html = (
+            f'<div class="reason-box">⚠ {esc(r.reason)}</div>'
+            if r.reason else ""
+        )
+
+        cards_html.append(f"""
+<div class="card {card_cls}">
+  <div class="card-header">
+    <div class="card-title">{esc(r.title_guess)}</div>
+    {rev_badge}
+  </div>
+  <div class="meta">
+    <span>📅 {date_str}</span>
+    <span>🏢 {issuer_str}</span>
+    <span>📄 {esc(r.ext.upper().lstrip('.'))}{pages_str} · {size_kb}</span>
+    <span class="method-tag">抽出: {method_str}</span>
+  </div>
+  <div class="tags">{tags_html}</div>
+  <div class="summary">{esc(r.summary) or '<i style="color:#94a3b8">本文を抽出できませんでした</i>'}</div>
+  <div class="filepath">📁 {esc(r.relpath)}</div>
+  {reason_html}
+</div>""")
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>NoticeForge 処理レポート</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;background:#f1f5f9;color:#1e293b;font-size:14px}}
+/* ─── ヘッダー ─── */
+.header{{background:linear-gradient(135deg,#1e40af,#2563eb);color:white;padding:24px 32px;display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:8px}}
+.header h1{{font-size:22px;font-weight:bold}}
+.header .sub{{opacity:.75;font-size:13px;margin-top:4px}}
+/* ─── 統計バー ─── */
+.stats-bar{{background:white;border-bottom:1px solid #e2e8f0;padding:16px 32px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
+.stat-box{{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 20px;text-align:center;min-width:100px}}
+.stat-box .num{{font-size:26px;font-weight:bold;color:#1e40af}}
+.stat-box .lbl{{font-size:11px;color:#64748b;margin-top:2px}}
+.stat-box.warn .num{{color:#dc2626}}
+.stat-box.good .num{{color:#16a34a}}
+.method-table{{margin-left:auto;font-size:12px;border-collapse:collapse}}
+.method-table td{{padding:2px 8px;border-bottom:1px solid #f1f5f9}}
+.method-table tr:last-child td{{border-bottom:none}}
+/* ─── カード一覧 ─── */
+.container{{max-width:1080px;margin:24px auto;padding:0 16px}}
+.card{{background:white;border-radius:10px;padding:18px 22px;margin-bottom:14px;border-left:5px solid #94a3b8;box-shadow:0 1px 4px rgba(0,0,0,.07);transition:box-shadow .2s}}
+.card:hover{{box-shadow:0 3px 10px rgba(0,0,0,.12)}}
+.card-ok{{border-left-color:#16a34a}}
+.card-review{{border-left-color:#dc2626}}
+.card-header{{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px}}
+.card-title{{font-size:15px;font-weight:bold;color:#0f172a;line-height:1.5;flex:1}}
+.ok-badge{{background:#dcfce7;color:#16a34a;border:1px solid #86efac;border-radius:6px;padding:2px 10px;font-size:12px;font-weight:bold;white-space:nowrap}}
+.rev-badge{{background:#fee2e2;color:#dc2626;border:1px solid #fca5a5;border-radius:6px;padding:2px 10px;font-size:12px;font-weight:bold;white-space:nowrap}}
+.meta{{display:flex;gap:14px;flex-wrap:wrap;color:#64748b;font-size:12px;margin-bottom:10px}}
+.method-tag{{color:#94a3b8;font-size:11px}}
+.tags{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}}
+.badge{{color:white;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:500}}
+.summary{{background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:10px 14px;font-size:13px;line-height:1.75;color:#334155;max-height:150px;overflow-y:auto;margin-bottom:10px;white-space:pre-wrap}}
+.filepath{{font-size:11px;color:#94a3b8;font-family:'Consolas','Courier New',monospace;word-break:break-all}}
+.reason-box{{margin-top:8px;font-size:12px;color:#92400e;background:#fffbeb;border:1px solid #fde68a;border-radius:5px;padding:6px 12px}}
+/* ─── フッター ─── */
+.footer{{text-align:center;color:#94a3b8;font-size:11px;padding:24px;margin-top:8px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>NoticeForge 処理レポート</h1>
+    <div class="sub">生成日時: {time.strftime('%Y年%m月%d日 %H:%M:%S')}</div>
+  </div>
+</div>
+<div class="stats-bar">
+  <div class="stat-box"><div class="num">{total}</div><div class="lbl">総ファイル数</div></div>
+  <div class="stat-box good"><div class="num">{ok_count}</div><div class="lbl">正常抽出</div></div>
+  <div class="stat-box warn"><div class="num">{needs_rev_count}</div><div class="lbl">要確認</div></div>
+  <table class="method-table">
+    <tr><td colspan="2" style="font-weight:bold;padding-bottom:4px">抽出方式別</td></tr>
+    {method_rows}
+  </table>
+</div>
+<div class="container">
+{''.join(cards_html)}
+</div>
+<div class="footer">NoticeForge &mdash; NotebookLM 連携ツール</div>
+</body>
+</html>"""
+
+    with open(os.path.join(outdir, "00_人間用レポート.html"), "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+
 def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_callback: Optional[Callable[[int, int, str, str], None]] = None) -> Tuple[int, int]:
     os.makedirs(outdir, exist_ok=True)
     max_depth = int(cfg.get("max_depth", 30))
@@ -400,5 +535,6 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     write_excel_index(outdir, records)
     write_md_indices(outdir, records)
     write_binded_texts(outdir, records, limit_bytes)
-    
+    write_html_report(outdir, records)
+
     return len(records), len([r for r in records if r.needs_review])

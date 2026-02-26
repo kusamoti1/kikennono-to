@@ -127,6 +127,10 @@ class App(ctk.CTk):
         self.open_excel.grid(row=0, column=1, sticky="ew", padx=(6, 0))
         self.open_excel.configure(state="disabled")
 
+        self.open_html = ctk.CTkButton(btns, text="📊 HTMLレポートを開く（人間向け）", command=self.open_html_report, fg_color="#7c3aed")
+        self.open_html.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.open_html.configure(state="disabled")
+
     def append_log(self, s: str):
         self.log.insert("end", s + "\n")
         self.log.see("end")
@@ -214,6 +218,7 @@ class App(ctk.CTk):
             self.append_log("[DONE] " + msg)
             self.open_out.configure(state="normal")
             self.open_excel.configure(state="normal")
+            self.open_html.configure(state="normal")
             messagebox.showinfo("処理完了", msg)
 
     def open_output(self):
@@ -223,6 +228,10 @@ class App(ctk.CTk):
     def open_excel_index(self):
         x = os.path.join(self.output_dir.get(), "00_統合目次.xlsx")
         if os.path.exists(x) and sys.platform.startswith("win"): os.startfile(x)
+
+    def open_html_report(self):
+        h = os.path.join(self.output_dir.get(), "00_人間用レポート.html")
+        if os.path.exists(h) and sys.platform.startswith("win"): os.startfile(h)
 
 if __name__ == "__main__":
     app = App()
