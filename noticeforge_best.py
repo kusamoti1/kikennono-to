@@ -141,6 +141,36 @@ XDW2TEXT_CANDIDATES = _build_xdw2text_candidates()
 # 一度見つかった実行ファイルのパスをキャッシュ（ファイルごとに7回試行しなくて済む）
 _XDW2TEXT_PATH: Optional[str] = None
 
+def _build_xdoc2txt_candidates() -> List[str]:
+    """xdoc2txt.exeの候補パスを構築する。
+    xdoc2txtはDocuWorks(.xdw)を含む多形式に対応した無料テキスト抽出ツール。
+    https://ebstudio.info/home/xdoc2txt.html"""
+    candidates: List[str] = ["xdoc2txt"]  # まずPATH上を探す
+    if sys.platform.startswith("win"):
+        try:
+            import glob as _glob
+            for pattern in [
+                r"C:\Program Files\xdoc2txt\xdoc2txt.exe",
+                r"C:\Program Files (x86)\xdoc2txt\xdoc2txt.exe",
+                r"C:\Program Files\*\xdoc2txt.exe",
+                r"C:\Program Files (x86)\*\xdoc2txt.exe",
+                r"C:\tools\xdoc2txt\xdoc2txt.exe",
+                r"C:\xdoc2txt\xdoc2txt.exe",
+            ]:
+                for found in _glob.glob(pattern):
+                    if found not in candidates:
+                        candidates.insert(1, found)
+        except Exception:
+            pass
+        candidates += [
+            r"C:\Program Files\xdoc2txt\xdoc2txt.exe",
+            r"C:\Program Files (x86)\xdoc2txt\xdoc2txt.exe",
+        ]
+    return candidates
+
+XDOC2TXT_CANDIDATES = _build_xdoc2txt_candidates()
+_XDOC2TXT_PATH: Optional[str] = None
+
 DEFAULTS: Dict[str, object] = {
     "min_chars_mainbody": 400, # 基準を少し甘くして抽出漏れを防止
     "max_depth": 30,
@@ -330,7 +360,35 @@ def extract_xdw(path: str) -> Tuple[str, str]:
         except Exception:
             continue
 
-    return "", "xdw2text_missing (要xdw2text.exe導入: DocuWorksインストールフォルダ内)"
+    # 方法3: xdoc2txt.exe を試す（無料ツール: https://ebstudio.info/home/xdoc2txt.html）
+    global _XDOC2TXT_PATH
+    xdoc2txt_candidates = [_XDOC2TXT_PATH] if _XDOC2TXT_PATH else XDOC2TXT_CANDIDATES
+    for cmd in xdoc2txt_candidates:
+        if not cmd:
+            continue
+        try:
+            result = subprocess.run(
+                [cmd, safe_p],
+                capture_output=True,
+                text=True,
+                encoding="cp932",
+                errors="ignore",
+                timeout=30,
+                **_WIN_NO_CONSOLE,
+            )
+            if result.returncode == 0:
+                _XDOC2TXT_PATH = cmd
+                if result.stdout.strip():
+                    return result.stdout, "xdw_xdoc2txt"
+                return "", "xdw_empty_or_protected"
+        except FileNotFoundError:
+            if cmd == _XDOC2TXT_PATH:
+                _XDOC2TXT_PATH = None
+            continue
+        except Exception:
+            continue
+
+    return "", "xdw2text_missing (要xdw2text.exe または xdoc2txt.exe 導入: DocuWorksフォルダ内 または https://ebstudio.info/home/xdoc2txt.html)"
 
 def split_main_attach(text: str, kws: List[str]) -> Tuple[str, str]:
     lines = text.splitlines()
@@ -1004,7 +1062,7 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
             needs_rev = True
             if not reason:
                 if "xdw2text_missing" in method:
-                    reason = "DocuWorksがインストールされていないため読取不可（xdw2text.exeが必要）"
+                    reason = "DocuWorksがインストールされていないため読取不可（xdw2text.exe または xdoc2txt.exe が必要: https://ebstudio.info/home/xdoc2txt.html）"
                 elif method == "unhandled":
                     reason = f"未対応ファイル形式 ({ext})"
                 elif "pymupdf_missing" in method:
