@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-NoticeForge Core Logic v5.0 (Ultimate: DocuWorks/Excel-MD/LongPath/Binder)
+NoticeForge Core Logic v5.1 (Ultimate: DocuWorks/Excel-MD/LongPath/Binder)
 """
 from __future__ import annotations
 import os, sys, re, json, time, hashlib, csv, subprocess, html as _html
