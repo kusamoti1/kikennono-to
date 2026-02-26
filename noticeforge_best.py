@@ -40,6 +40,23 @@ try:
 except Exception:
     xlrd = None
 
+try:
+    import xdwlib
+    XDWLIB_AVAILABLE = True
+except Exception:
+    XDWLIB_AVAILABLE = False
+
+# xdw2text.exe の候補パス（DocuWorksの一般的なインストール先を網羅）
+XDW2TEXT_CANDIDATES = [
+    "xdw2text",  # PATH上にある場合
+    r"C:\Program Files\Fuji Xerox\DocuWorks\xdw2text.exe",
+    r"C:\Program Files (x86)\Fuji Xerox\DocuWorks\xdw2text.exe",
+    r"C:\Program Files\FUJIFILM\DocuWorks\xdw2text.exe",
+    r"C:\Program Files (x86)\FUJIFILM\DocuWorks\xdw2text.exe",
+    r"C:\Program Files\DocuWorks\xdw2text.exe",
+    r"C:\Program Files (x86)\DocuWorks\xdw2text.exe",
+]
+
 DEFAULTS: Dict[str, object] = {
     "min_chars_mainbody": 400, # 基準を少し甘くして抽出漏れを防止
     "max_depth": 30,
@@ -169,17 +186,41 @@ def extract_excel(path: str) -> Tuple[str, str]:
         return "", f"excel_err:{e.__class__.__name__}"
 
 def extract_xdw(path: str) -> Tuple[str, str]:
-    """DocuWorksから直接テキストを抽出（xdw2textコマンドを使用）"""
+    """DocuWorksから直接テキストを抽出（xdwlib優先、次にxdw2text複数パス試行）"""
     safe_p = get_safe_path(path)
-    try:
-        result = subprocess.run(["xdw2text", safe_p], capture_output=True, text=True, encoding="cp932", errors="ignore")
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout, "xdw_text"
-        return "", "xdw_empty_or_protected"
-    except FileNotFoundError:
-        return "", "xdw2text_missing (要xdw2text.exe導入)"
-    except Exception as e:
-        return "", f"xdw_err:{e.__class__.__name__}"
+
+    # 方法1: xdwlib（Python製DocuWorksバインディング）を優先的に試す
+    if XDWLIB_AVAILABLE:
+        try:
+            doc = xdwlib.xdwopen(path)
+            texts = []
+            for pg in range(doc.pages):
+                page = doc[pg]
+                texts.append(page.text)
+            doc.close()
+            result = "\n".join(texts)
+            if result.strip():
+                return result, "xdw_xdwlib"
+        except Exception:
+            pass  # 失敗したらxdw2textにフォールバック
+
+    # 方法2: xdw2text.exe を複数の候補パスで試す
+    for cmd in XDW2TEXT_CANDIDATES:
+        try:
+            result = subprocess.run(
+                [cmd, safe_p],
+                capture_output=True, text=True,
+                encoding="cp932", errors="ignore",
+                timeout=30
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout, "xdw_text"
+        except FileNotFoundError:
+            continue  # このパスにはexeがないので次を試す
+        except Exception:
+            continue
+
+    return "", "xdw2text_missing (要xdw2text.exe導入: DocuWorksインストールフォルダ内)"
 
 def split_main_attach(text: str, kws: List[str]) -> Tuple[str, str]:
     lines = text.splitlines()
@@ -302,7 +343,19 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     use_ocr = bool(cfg.get("use_ocr", False))
     limit_bytes = int(cfg.get("bind_bytes_limit", 15000000))
 
-    targets = [os.path.join(root, fn) for root, _, files in os.walk(indir) if os.path.relpath(root, indir).count(os.sep) < max_depth for fn in files]
+    # システムファイル・一時ファイルを除外するフィルター
+    SKIP_FILENAMES = frozenset({"thumbs.db", "desktop.ini", ".ds_store"})
+    SKIP_EXTENSIONS = frozenset({".db", ".tmp", ".bak", ".lnk", ".ini", ".cache"})
+
+    targets = [
+        os.path.join(root, fn)
+        for root, _, files in os.walk(indir)
+        if os.path.relpath(root, indir).count(os.sep) < max_depth
+        for fn in files
+        if fn.lower() not in SKIP_FILENAMES
+        and os.path.splitext(fn)[1].lower() not in SKIP_EXTENSIONS
+        and not fn.startswith("~$")  # Officeの一時ロックファイルを除外
+    ]
     total_files = len(targets)
     records: List[Record] = []
 
