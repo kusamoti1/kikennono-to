@@ -1,13 +1,14 @@
 @echo off
 setlocal ENABLEDELAYEDEXPANSION
 
-REM NoticeForge Modern GUI v3.1 - Windows runner
+REM NoticeForge GUI - Windows 起動スクリプト
 
 if not exist ".venv\Scripts\python.exe" (
-  echo [INFO] Creating venv...
+  echo [INFO] 初回セットアップ中（少し時間がかかります）...
   python -m venv .venv
   if errorlevel 1 (
-    echo [ERROR] Failed to create venv. Ensure Python is installed and 'python' works.
+    echo [ERROR] Pythonの仮想環境の作成に失敗しました。
+    echo         Python がインストールされているか確認してください。
     pause
     exit /b 1
   )
@@ -15,23 +16,20 @@ if not exist ".venv\Scripts\python.exe" (
 
 call .venv\Scripts\activate.bat
 if errorlevel 1 (
-  echo [ERROR] Failed to activate venv.
+  echo [ERROR] 仮想環境の起動に失敗しました。
   pause
   exit /b 1
 )
 
-echo [INFO] Upgrading pip...
-.venv\Scripts\python.exe -m pip install --upgrade pip
-
-echo [INFO] Installing requirements...
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+echo [INFO] パッケージを確認しています...
+.venv\Scripts\python.exe -m pip install --upgrade pip -q
+.venv\Scripts\python.exe -m pip install -r requirements.txt -q
 if errorlevel 1 (
-  echo [ERROR] pip install failed. Check network/proxy and retry.
+  echo [ERROR] 必要なパッケージのインストールに失敗しました。
+  echo         ネットワーク接続を確認して再試行してください。
   pause
   exit /b 1
 )
 
-echo [INFO] Launching NoticeForge Modern GUI v3.1...
-.venv\Scripts\python.exe noticeforge_gui.py
-
-pause
+REM GUIをコンソールウィンドウなしで起動 (pythonw.exe = ウィンドウなしPython)
+start "" .venv\Scripts\pythonw.exe noticeforge_gui.py

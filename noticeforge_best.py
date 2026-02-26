@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-NoticeForge Core Logic v5.1 (Ultimate: DocuWorks/Excel-MD/LongPath/Binder)
+NoticeForge Core Logic v5.2 (Ultimate: DocuWorks/Excel-MD/LongPath/Binder)
 """
 from __future__ import annotations
 import os, sys, re, json, time, hashlib, csv, subprocess, html as _html
@@ -753,57 +753,100 @@ def write_html_report(outdir: str, records: List[Record]):
     def esc(s: object) -> str:
         return _html.escape(str(s) if s is not None else "")
 
-    total = len(records)
-    ok_count = sum(1 for r in records if not r.needs_review)
+    total       = len(records)
+    ok_count    = sum(1 for r in records if not r.needs_review)
     needs_rev_count = total - ok_count
+    ok_pct      = round(ok_count    / total * 100) if total else 0
+    rev_pct     = round(needs_rev_count / total * 100) if total else 0
 
-    # 抽出方式ごとの集計
+    # ─── ファイル種別集計 ─────────────────────────────────────────
+    ext_label_map = {
+        ".pdf": "PDF", ".docx": "Word",
+        ".xlsx": "Excel", ".xlsm": "Excel", ".xls": "Excel",
+        ".xdw": "DocuWorks", ".xbd": "DocuWorks",
+        ".txt": "テキスト", ".csv": "CSV",
+    }
+    ext_counts: Dict[str, int] = {}
+    for r in records:
+        lbl = ext_label_map.get(r.ext.lower(), f"その他({r.ext})")
+        ext_counts[lbl] = ext_counts.get(lbl, 0) + 1
+    ext_breakdown_parts = [
+        f'<span class="type-chip">{esc(lbl)} <b>{cnt}</b>件</span>'
+        for lbl, cnt in sorted(ext_counts.items(), key=lambda x: -x[1])
+    ]
+    ext_breakdown_html = "".join(ext_breakdown_parts)
+
+    # ─── 抽出方式集計（抽出方式別テーブル） ─────────────────────────
     method_counts: Dict[str, int] = {}
     for r in records:
         method_counts[r.method] = method_counts.get(r.method, 0) + 1
     method_rows = "".join(
-        f"<tr><td>{esc(m)}</td><td style='text-align:right'>{c}</td></tr>"
+        f"<tr><td>{esc(m)}</td><td class='mcnt'>{c}</td></tr>"
         for m, c in sorted(method_counts.items(), key=lambda x: -x[1])
     )
 
-    # 施設タグ・業務タグ用のバッジ色マップ
+    # ─── 要確認の主要理由を集計 ─────────────────────────────────────
+    review_reasons: Dict[str, int] = {}
+    for r in records:
+        if r.needs_review and r.reason:
+            key = r.reason[:35] + ("…" if len(r.reason) > 35 else "")
+            review_reasons[key] = review_reasons.get(key, 0) + 1
+    review_reason_rows = "".join(
+        f'<li><span class="rr-count">{c}件</span> {esc(k)}</li>'
+        for k, c in sorted(review_reasons.items(), key=lambda x: -x[1])[:5]
+    )
+
+    # ─── バッジ色 ─────────────────────────────────────────────────
     FAC_COLOR  = "#2563eb"
     WORK_COLOR = "#16a34a"
-
     def make_badge(text: str, color: str) -> str:
         return f'<span class="badge" style="background:{color}">{esc(text)}</span>'
 
-    # ファイルカード生成
-    cards_html = []
-    for r in records:
+    # ─── TOCアイテム生成 ─────────────────────────────────────────
+    toc_items_html: List[str] = []
+    for idx, r in enumerate(records):
+        toc_cls  = "toc-review" if r.needs_review else "toc-ok"
+        toc_icon = "⚠" if r.needs_review else "✓"
+        short_t  = r.title_guess[:28] + ("…" if len(r.title_guess) > 28 else "")
+        d_str    = r.date_guess or "日付不明"
+        tsearch  = (r.title_guess + " " + d_str).lower().replace('"', "")
+        toc_items_html.append(
+            f'<a href="#card-{idx}" class="toc-item {toc_cls}" data-search="{esc(tsearch)}">'
+            f'<span class="toc-icon">{toc_icon}</span>'
+            f'<span class="toc-body">'
+            f'<span class="toc-num">{idx + 1}.</span>'
+            f'<span class="toc-title">{esc(short_t)}</span>'
+            f'<span class="toc-date">{esc(d_str)}</span>'
+            f'</span></a>'
+        )
+
+    # ─── カード生成 ───────────────────────────────────────────────
+    cards_html: List[str] = []
+    for idx, r in enumerate(records):
         card_cls  = "card-review" if r.needs_review else "card-ok"
         rev_badge = '<span class="rev-badge">⚠ 要確認</span>' if r.needs_review else \
                     '<span class="ok-badge">✓ 正常</span>'
         fac_badges  = "".join(make_badge(t, FAC_COLOR)  for t in r.tags_facility)
         work_badges = "".join(make_badge(t, WORK_COLOR) for t in r.tags_work)
-        tags_html   = (fac_badges + work_badges) or '<span style="color:#94a3b8;font-size:12px">タグなし</span>'
-
+        tags_html   = (fac_badges + work_badges) or \
+                      '<span style="color:#94a3b8;font-size:12px">タグなし</span>'
         date_str   = esc(r.date_guess)   or "日付不明"
         issuer_str = esc(r.issuer_guess) or "発出者不明"
         pages_str  = f"/{r.pages}p" if r.pages else ""
-        method_str = esc(r.method)
         size_kb    = f"{r.size // 1024:,} KB" if r.size >= 1024 else f"{r.size} B"
-
         reason_html = (
-            f'<div class="reason-box">⚠ {esc(r.reason)}</div>'
-            if r.reason else ""
+            f'<div class="reason-box">⚠ {esc(r.reason)}</div>' if r.reason else ""
         )
-
-        # data-search に検索対象テキストを全部まとめる（小文字化はJS側で行う）
         search_data = " ".join([
             r.title_guess, r.summary, r.relpath,
             r.date_guess, r.issuer_guess,
             " ".join(r.tags_facility), " ".join(r.tags_work),
             r.reason, r.method,
         ]).replace('"', '')
-
+        summary_html = (esc(r.summary)
+                        or '<i style="color:#94a3b8">本文を抽出できませんでした</i>')
         cards_html.append(f"""
-<div class="card {card_cls}" data-search="{esc(search_data.lower())}">
+<div id="card-{idx}" class="card {card_cls}" data-search="{esc(search_data.lower())}">
   <div class="card-header">
     <div class="card-title">{esc(r.title_guess)}</div>
     {rev_badge}
@@ -812,13 +855,15 @@ def write_html_report(outdir: str, records: List[Record]):
     <span>📅 {date_str}</span>
     <span>🏢 {issuer_str}</span>
     <span>📄 {esc(r.ext.upper().lstrip('.'))}{pages_str} · {size_kb}</span>
-    <span class="method-tag">抽出: {method_str}</span>
+    <span class="method-tag">抽出: {esc(r.method)}</span>
   </div>
   <div class="tags">{tags_html}</div>
-  <div class="summary">{esc(r.summary) or '<i style="color:#94a3b8">本文を抽出できませんでした</i>'}</div>
+  <div class="summary">{summary_html}</div>
   <div class="filepath">📁 {esc(r.relpath)}</div>
   {reason_html}
 </div>""")
+
+    gen_time = time.strftime('%Y年%m月%d日 %H:%M:%S')
 
     html_content = f"""<!DOCTYPE html>
 <html lang="ja">
@@ -829,31 +874,150 @@ def write_html_report(outdir: str, records: List[Record]):
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;background:#f1f5f9;color:#1e293b;font-size:14px}}
-/* ─── ヘッダー ─── */
-.header{{background:linear-gradient(135deg,#1e40af,#2563eb);color:white;padding:24px 32px;display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:8px}}
-.header h1{{font-size:22px;font-weight:bold}}
-.header .sub{{opacity:.75;font-size:13px;margin-top:4px}}
-/* ─── 統計バー ─── */
-.stats-bar{{background:white;border-bottom:1px solid #e2e8f0;padding:16px 32px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
-.stat-box{{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 20px;text-align:center;min-width:100px}}
-.stat-box .num{{font-size:26px;font-weight:bold;color:#1e40af}}
-.stat-box .lbl{{font-size:11px;color:#64748b;margin-top:2px}}
+
+/* ════════════════════════════════════
+   左サイドバー（文書目次）
+   ════════════════════════════════════ */
+.toc-sidebar{{
+  position:fixed;left:0;top:0;width:252px;height:100vh;
+  background:#0f172a;color:#e2e8f0;
+  display:flex;flex-direction:column;z-index:200;
+  border-right:1px solid #1e3a5f;
+}}
+.toc-head{{
+  padding:14px 16px;font-size:14px;font-weight:bold;
+  background:#1e3a8a;color:white;
+  display:flex;align-items:center;gap:8px;flex-shrink:0;
+}}
+.toc-summary-row{{
+  padding:8px 16px;font-size:12px;color:#94a3b8;
+  background:#1e293b;border-bottom:1px solid #334155;flex-shrink:0;
+  display:flex;gap:14px;
+}}
+.toc-ok-sum{{color:#4ade80;font-weight:bold}}
+.toc-rev-sum{{color:#f87171;font-weight:bold}}
+.toc-filter-wrap{{
+  padding:8px 12px;background:#1e293b;
+  border-bottom:1px solid #334155;flex-shrink:0;
+}}
+.toc-filter{{
+  width:100%;padding:6px 10px;border-radius:6px;
+  border:1px solid #334155;background:#0f172a;
+  color:#e2e8f0;font-size:12px;font-family:inherit;outline:none;
+}}
+.toc-filter:focus{{border-color:#3b82f6}}
+.toc-nav{{flex:1;overflow-y:auto;padding:4px 0}}
+.toc-nav::-webkit-scrollbar{{width:4px}}
+.toc-nav::-webkit-scrollbar-thumb{{background:#334155;border-radius:2px}}
+.toc-item{{
+  display:flex;align-items:flex-start;gap:8px;
+  padding:7px 14px;text-decoration:none;color:#cbd5e1;
+  font-size:12px;line-height:1.4;
+  border-left:3px solid transparent;
+  transition:background .15s,border-color .15s;
+}}
+.toc-item:hover{{background:#1e293b;color:white}}
+.toc-item.active{{background:#1e3a8a;border-left-color:#60a5fa;color:white}}
+.toc-icon{{font-size:11px;flex-shrink:0;margin-top:1px;width:14px;text-align:center}}
+.toc-ok   .toc-icon{{color:#4ade80}}
+.toc-review .toc-icon{{color:#f87171}}
+.toc-body{{display:flex;flex-direction:column;min-width:0;flex:1}}
+.toc-num{{color:#64748b;font-size:10px}}
+.toc-title{{font-size:12px;color:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.toc-date{{font-size:10px;color:#64748b;margin-top:1px}}
+.toc-item.toc-hidden{{display:none}}
+.toc-empty{{padding:16px;font-size:12px;color:#475569;text-align:center}}
+
+/* ════════════════════════════════════
+   メインコンテンツ
+   ════════════════════════════════════ */
+.main-wrapper{{margin-left:252px}}
+
+/* ─── ページヘッダー ─── */
+.page-header{{
+  background:linear-gradient(135deg,#1e40af,#2563eb);
+  color:white;padding:20px 32px;
+  display:flex;justify-content:space-between;align-items:flex-end;
+  flex-wrap:wrap;gap:8px;
+}}
+.page-header h1{{font-size:22px;font-weight:bold}}
+.page-header .sub{{opacity:.75;font-size:12px;margin-top:4px}}
+
+/* ─── 処理概要セクション ─── */
+.overview-section{{
+  background:white;border-bottom:1px solid #e2e8f0;padding:20px 32px 16px;
+}}
+.overview-title{{
+  font-size:13px;font-weight:bold;color:#64748b;
+  text-transform:uppercase;letter-spacing:.05em;margin-bottom:14px;
+}}
+.stats-row{{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;align-items:stretch}}
+.stat-box{{
+  background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;
+  padding:14px 24px;text-align:center;min-width:110px;
+}}
+.stat-box .num{{font-size:30px;font-weight:bold;color:#1e40af;line-height:1}}
+.stat-box .lbl{{font-size:11px;color:#64748b;margin-top:6px}}
+.stat-box .pct{{font-size:11px;color:#94a3b8;margin-top:2px}}
 .stat-box.warn .num{{color:#dc2626}}
 .stat-box.good .num{{color:#16a34a}}
-.method-table{{margin-left:auto;font-size:12px;border-collapse:collapse}}
-.method-table td{{padding:2px 8px;border-bottom:1px solid #f1f5f9}}
-.method-table tr:last-child td{{border-bottom:none}}
-/* ─── カード一覧 ─── */
-.container{{max-width:1080px;margin:24px auto;padding:0 16px}}
-/* ─── 検索バー ─── */
-.search-bar{{background:white;padding:12px 32px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:100;box-shadow:0 2px 6px rgba(0,0,0,.06)}}
-.search-input{{flex:1;max-width:680px;padding:10px 16px 10px 42px;border:2px solid #e2e8f0;border-radius:8px;font-size:14px;font-family:inherit;outline:none;transition:border-color .2s;background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' fill='none' stroke='%2394a3b8' stroke-width='2' viewBox='0 0 24 24'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.35-4.35'/%3E%3C/svg%3E") no-repeat 12px center}}
+.overview-bottom{{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}}
+.type-section{{flex:1;min-width:200px}}
+.type-label{{font-size:12px;color:#64748b;font-weight:bold;margin-bottom:8px}}
+.type-chips{{display:flex;gap:8px;flex-wrap:wrap}}
+.type-chip{{
+  background:#f1f5f9;border:1px solid #e2e8f0;border-radius:20px;
+  padding:4px 12px;font-size:12px;color:#475569;
+}}
+.type-chip b{{color:#1e40af}}
+.method-section{{flex:1;min-width:180px}}
+.method-section table{{font-size:12px;border-collapse:collapse;width:100%}}
+.method-section td{{padding:3px 8px;border-bottom:1px solid #f1f5f9;color:#475569}}
+.method-section td.mcnt{{text-align:right;font-weight:bold;color:#1e40af}}
+.method-section tr:last-child td{{border-bottom:none}}
+.review-section{{flex:1;min-width:180px}}
+.review-reasons{{list-style:none;font-size:12px;color:#92400e}}
+.review-reasons li{{padding:2px 0;display:flex;align-items:baseline;gap:6px}}
+.rr-count{{
+  background:#fee2e2;color:#dc2626;border-radius:4px;
+  padding:1px 6px;font-weight:bold;font-size:11px;white-space:nowrap;flex-shrink:0;
+}}
+.guide-box{{
+  background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;
+  padding:10px 16px;font-size:12px;color:#1e40af;margin-top:14px;
+  display:flex;align-items:flex-start;gap:8px;
+}}
+.guide-box strong{{font-weight:bold}}
+
+/* ─── 検索バー（sticky）─── */
+.search-bar{{
+  background:white;padding:10px 24px;border-bottom:1px solid #e2e8f0;
+  display:flex;align-items:center;gap:10px;
+  position:sticky;top:0;z-index:100;
+  box-shadow:0 2px 6px rgba(0,0,0,.06);
+}}
+.search-input{{
+  flex:1;max-width:680px;padding:9px 14px 9px 40px;
+  border:2px solid #e2e8f0;border-radius:8px;
+  font-size:13px;font-family:inherit;outline:none;
+  transition:border-color .2s;
+  background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%2394a3b8' stroke-width='2' viewBox='0 0 24 24'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.35-4.35'/%3E%3C/svg%3E") no-repeat 12px center;
+}}
 .search-input:focus{{border-color:#2563eb}}
-.search-hint{{font-size:12px;color:#94a3b8}}
-.search-count{{font-size:13px;color:#64748b;font-weight:bold;white-space:nowrap}}
+.search-hint{{font-size:11px;color:#94a3b8}}
+.search-count{{font-size:13px;color:#64748b;font-weight:bold;white-space:nowrap;margin-left:auto}}
 .no-results{{text-align:center;padding:64px 16px;color:#94a3b8;font-size:15px;display:none}}
-.card{{background:white;border-radius:10px;padding:18px 22px;margin-bottom:14px;border-left:5px solid #94a3b8;box-shadow:0 1px 4px rgba(0,0,0,.07);transition:box-shadow .2s}}
+
+/* ─── カード ─── */
+.container{{max-width:1000px;margin:20px auto;padding:0 20px}}
+.card{{
+  background:white;border-radius:10px;padding:18px 22px;margin-bottom:14px;
+  border-left:5px solid #94a3b8;
+  box-shadow:0 1px 4px rgba(0,0,0,.07);
+  transition:box-shadow .2s;scroll-margin-top:56px;
+}}
 .card:hover{{box-shadow:0 3px 10px rgba(0,0,0,.12)}}
+.card.highlight{{outline:3px solid #3b82f6;outline-offset:2px}}
 .card-ok{{border-left-color:#16a34a}}
 .card-review{{border-left-color:#dc2626}}
 .card-header{{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px}}
@@ -864,60 +1028,183 @@ body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;backgrou
 .method-tag{{color:#94a3b8;font-size:11px}}
 .tags{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}}
 .badge{{color:white;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:500}}
-.summary{{background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:10px 14px;font-size:13px;line-height:1.75;color:#334155;max-height:150px;overflow-y:auto;margin-bottom:10px;white-space:pre-wrap}}
+.summary{{
+  background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;
+  padding:10px 14px;font-size:13px;line-height:1.8;color:#334155;
+  max-height:160px;overflow-y:auto;margin-bottom:10px;white-space:pre-wrap;
+}}
 .filepath{{font-size:11px;color:#94a3b8;font-family:'Consolas','Courier New',monospace;word-break:break-all}}
 .reason-box{{margin-top:8px;font-size:12px;color:#92400e;background:#fffbeb;border:1px solid #fde68a;border-radius:5px;padding:6px 12px}}
+
 /* ─── フッター ─── */
 .footer{{text-align:center;color:#94a3b8;font-size:11px;padding:24px;margin-top:8px}}
+
+/* ─── レスポンシブ（狭い画面では目次非表示） ─── */
+@media(max-width:900px){{
+  .toc-sidebar{{display:none}}
+  .main-wrapper{{margin-left:0}}
+}}
 </style>
 </head>
 <body>
-<div class="header">
-  <div>
-    <h1>NoticeForge 処理レポート</h1>
-    <div class="sub">生成日時: {time.strftime('%Y年%m月%d日 %H:%M:%S')}</div>
+
+<!-- ════ 左サイドバー（文書目次）════ -->
+<aside class="toc-sidebar">
+  <div class="toc-head">📋 文書目次</div>
+  <div class="toc-summary-row">
+    <span class="toc-ok-sum">✓ 正常 {ok_count}件</span>
+    <span class="toc-rev-sum">⚠ 要確認 {needs_rev_count}件</span>
   </div>
+  <div class="toc-filter-wrap">
+    <input class="toc-filter" id="tocFilter" type="text"
+      placeholder="目次を絞り込む…" oninput="filterToc()">
+  </div>
+  <nav class="toc-nav" id="tocNav">
+    {''.join(toc_items_html)}
+    <div class="toc-empty" id="tocEmpty" style="display:none">該当なし</div>
+  </nav>
+</aside>
+
+<!-- ════ メインコンテンツ ════ -->
+<div class="main-wrapper">
+
+  <!-- ページヘッダー -->
+  <header class="page-header">
+    <div>
+      <h1>NoticeForge 処理レポート</h1>
+      <div class="sub">生成日時: {gen_time}</div>
+    </div>
+  </header>
+
+  <!-- 処理概要 -->
+  <section class="overview-section">
+    <div class="overview-title">処理概要</div>
+    <div class="stats-row">
+      <div class="stat-box">
+        <div class="num">{total}</div>
+        <div class="lbl">総ファイル数</div>
+      </div>
+      <div class="stat-box good">
+        <div class="num">{ok_count}</div>
+        <div class="lbl">正常抽出</div>
+        <div class="pct">{ok_pct}%</div>
+      </div>
+      <div class="stat-box warn">
+        <div class="num">{needs_rev_count}</div>
+        <div class="lbl">要確認</div>
+        <div class="pct">{rev_pct}%</div>
+      </div>
+    </div>
+    <div class="overview-bottom">
+      <div class="type-section">
+        <div class="type-label">ファイル種別</div>
+        <div class="type-chips">{ext_breakdown_html}</div>
+      </div>
+      <div class="method-section">
+        <div class="type-label">抽出方式別</div>
+        <table><tbody>{method_rows}</tbody></table>
+      </div>
+      {'<div class="review-section"><div class="type-label">要確認の主な理由</div><ul class="review-reasons">' + review_reason_rows + '</ul></div>' if review_reason_rows else ''}
+    </div>
+    <div class="guide-box">
+      💡 <span><strong>NotebookLMへの入力：</strong>
+      出力フォルダの「00_統合目次.md」と「NotebookLM用_統合データ_○○.txt」を
+      NotebookLMにアップロードしてください。
+      「要確認」ファイルは目次に含まれますが、本文の精度が低い場合があります。</span>
+    </div>
+  </section>
+
+  <!-- 検索バー（sticky）-->
+  <div class="search-bar">
+    <input class="search-input" id="searchInput" type="text"
+      placeholder="キーワードで絞り込む（タイトル・発出者・ファイル名・概要など。NotebookLMの引用文をそのまま貼り付けてもOK）"
+      oninput="filterCards()">
+    <span class="search-hint">→ 元ファイルを素早く特定できます</span>
+    <span class="search-count" id="searchCount"></span>
+  </div>
+
+  <!-- カード一覧 -->
+  <div class="container">
+    {''.join(cards_html)}
+    <div class="no-results" id="noResults">
+      該当するファイルが見つかりませんでした。別のキーワードを試してください。
+    </div>
+  </div>
+
+  <div class="footer">NoticeForge &mdash; NotebookLM 連携ツール &nbsp;|&nbsp; 生成: {gen_time}</div>
 </div>
-<div class="stats-bar">
-  <div class="stat-box"><div class="num">{total}</div><div class="lbl">総ファイル数</div></div>
-  <div class="stat-box good"><div class="num">{ok_count}</div><div class="lbl">正常抽出</div></div>
-  <div class="stat-box warn"><div class="num">{needs_rev_count}</div><div class="lbl">要確認</div></div>
-  <table class="method-table">
-    <tr><td colspan="2" style="font-weight:bold;padding-bottom:4px">抽出方式別</td></tr>
-    {method_rows}
-  </table>
-</div>
-<div class="search-bar">
-  <input class="search-input" id="searchInput" type="text"
-    placeholder="キーワードで絞り込む（タイトル・発出者・ファイル名など。NotebookLMの引用文をそのまま貼り付けてもOK）"
-    oninput="filterCards()">
-  <span class="search-hint">→ 元ファイルを素早く探せます</span>
-  <span class="search-count" id="searchCount"></span>
-</div>
-<div class="container">
-{''.join(cards_html)}
-  <div class="no-results" id="noResults">該当するファイルが見つかりませんでした。別のキーワードを試してください。</div>
-</div>
-<div class="footer">NoticeForge &mdash; NotebookLM 連携ツール</div>
+
 <script>
+/* ── カード検索 ── */
 function filterCards() {{
   var q = document.getElementById('searchInput').value.toLowerCase();
   var cards = document.querySelectorAll('.card');
   var shown = 0;
   cards.forEach(function(card) {{
-    var text = card.getAttribute('data-search');
-    var match = !q || text.includes(q);
+    var match = !q || card.getAttribute('data-search').includes(q);
     card.style.display = match ? '' : 'none';
     if (match) shown++;
   }});
   var countEl = document.getElementById('searchCount');
   var noRes   = document.getElementById('noResults');
   countEl.textContent = q ? (shown + ' 件 / ' + cards.length + ' 件中') : (cards.length + ' 件');
-  noRes.style.display = (q && shown === 0) ? 'block' : 'none';
+  noRes.style.display  = (q && shown === 0) ? 'block' : 'none';
 }}
-window.addEventListener('load', function() {{
-  document.getElementById('searchCount').textContent = document.querySelectorAll('.card').length + ' 件';
-}});
+
+/* ── 目次絞り込み ── */
+function filterToc() {{
+  var q = document.getElementById('tocFilter').value.toLowerCase();
+  var items = document.querySelectorAll('.toc-item');
+  var shown = 0;
+  items.forEach(function(a) {{
+    var match = !q || a.getAttribute('data-search').includes(q);
+    a.classList.toggle('toc-hidden', !match);
+    if (match) shown++;
+  }});
+  document.getElementById('tocEmpty').style.display = (q && shown === 0) ? 'block' : 'none';
+}}
+
+/* ── スクロール連動でTOCをハイライト ── */
+(function() {{
+  var tocItems = {{}};
+  document.querySelectorAll('.toc-item').forEach(function(a) {{
+    var id = a.getAttribute('href').slice(1);
+    tocItems[id] = a;
+  }});
+  var observer = new IntersectionObserver(function(entries) {{
+    entries.forEach(function(entry) {{
+      if (entry.isIntersecting) {{
+        Object.values(tocItems).forEach(function(a) {{ a.classList.remove('active'); }});
+        var active = tocItems[entry.target.id];
+        if (active) {{
+          active.classList.add('active');
+          var nav = document.getElementById('tocNav');
+          if (nav) {{
+            var offset = active.offsetTop - nav.offsetTop;
+            nav.scrollTop = offset - nav.clientHeight / 3;
+          }}
+        }}
+      }}
+    }});
+  }}, {{ rootMargin: '-5% 0% -70% 0%', threshold: 0 }});
+  document.querySelectorAll('.card').forEach(function(c) {{ observer.observe(c); }});
+
+  /* ── 初期件数表示 ── */
+  document.getElementById('searchCount').textContent =
+    document.querySelectorAll('.card').length + ' 件';
+
+  /* ── TOCリンクをクリックしたときカードを一瞬ハイライト ── */
+  document.querySelectorAll('.toc-item').forEach(function(a) {{
+    a.addEventListener('click', function() {{
+      var id = a.getAttribute('href').slice(1);
+      var card = document.getElementById(id);
+      if (card) {{
+        card.classList.add('highlight');
+        setTimeout(function() {{ card.classList.remove('highlight'); }}, 1200);
+      }}
+    }});
+  }});
+}})();
 </script>
 </body>
 </html>"""
@@ -926,7 +1213,7 @@ window.addEventListener('load', function() {{
         f.write(html_content)
 
 
-def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_callback: Optional[Callable[[int, int, str, str], None]] = None) -> Tuple[int, int, str]:
+def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_callback: Optional[Callable[[int, int, str, str], None]] = None, stop_event=None) -> Tuple[int, int, str]:
     os.makedirs(outdir, exist_ok=True)
     outdir_abs = os.path.abspath(outdir)
 
@@ -999,6 +1286,11 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     ]
 
     for i, path in enumerate(targets):
+        # 停止リクエストをチェック
+        if stop_event and stop_event.is_set():
+            log_lines.append("[STOPPED] ユーザーにより処理を途中で停止しました。")
+            break
+
         rel = os.path.relpath(path, indir)
         ext = os.path.splitext(path)[1].lower()
         if progress_callback: progress_callback(i + 1, total_files, rel, "(確認中...)")
