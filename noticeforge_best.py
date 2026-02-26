@@ -30,7 +30,7 @@ except Exception:
 
 try:
     import openpyxl
-    from openpyxl.styles import Font, Alignment
+    from openpyxl.styles import Font, Alignment, PatternFill
     from openpyxl.utils import get_column_letter
 except Exception:
     openpyxl = None
@@ -169,14 +169,20 @@ def extract_pdf(path: str, use_ocr: bool) -> Tuple[str, Optional[int], str]:
         for i in range(pages):
             page = doc.load_page(i)
             page_text = page.get_text("text") or ""
-            if use_ocr and len(page_text.strip()) < 50 and TESSERACT_AVAILABLE:
+            # OCR判断:
+            #   use_ocr=True → 50文字未満のページにOCR（手動指定モード）
+            #   use_ocr=False → 10文字未満の極端に空なページにのみ自動OCR（画像PDF自動検出）
+            ocr_trigger = 50 if use_ocr else 10
+            if len(page_text.strip()) < ocr_trigger and TESSERACT_AVAILABLE:
                 try:
                     pix = page.get_pixmap(dpi=200)
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     ocr_text = pytesseract.image_to_string(img, lang="jpn")
                     ocr_text = re.sub(r'([ぁ-んァ-ン一-龥])\s+([ぁ-んァ-ン一-龥])', r'\1\2', ocr_text)
-                    page_text += "\n" + ocr_text
-                    method = "pdf_ocr"
+                    if ocr_text.strip():
+                        # 完全に空だったページはOCR結果で置換、テキストがあった場合は追記
+                        page_text = ocr_text if len(page_text.strip()) < 10 else page_text + "\n" + ocr_text
+                        method = "pdf_ocr" if use_ocr else "pdf_ocr_auto"
                 except Exception:
                     pass
             text_parts.append(page_text)
@@ -366,14 +372,38 @@ def tag_text(text: str) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
     if not fac and re.search(r"危険物|消防法", target): fac.append("共通")
     return fac, work, ev
 
+def _format_summary(core: str, n: int) -> str:
+    """概要テキストを読みやすく整形する（空行を間引き、終端行でストップ）"""
+    result_lines: List[str] = []
+    char_count = 0
+    prev_blank = False
+    for line in core.splitlines():
+        stripped = line.strip()
+        # 「以上」「以下余白」などの終端行でストップ
+        if re.match(r"^\s*(以上|以下余白|（了）|－\s*了\s*－)\s*$", stripped):
+            break
+        if not stripped:
+            # 連続した空行は1つにまとめる
+            if result_lines and not prev_blank:
+                result_lines.append("")
+            prev_blank = True
+            continue
+        prev_blank = False
+        result_lines.append(stripped)
+        char_count += len(stripped)
+        if char_count >= n:
+            break
+    result = "\n".join(result_lines).rstrip()
+    return result[:n] + ("…" if len(result) > n else "")
+
+
 def make_summary(main_text: str, n: int) -> str:
     """通知の概要を生成する（ヘッダーをスキップして本文の要点を抽出）"""
     # 「記」以降があればその内容を優先（日本の公文書では「記」が本文の始まりを示す）
     ki_match = re.search(r"\n\s*記\s*\n", main_text)
     if ki_match:
-        core = main_text[ki_match.end():]
-        s = re.sub(r"\s+", " ", core.strip())
-        return s[:n] + ("…" if len(s) > n else "")
+        core = main_text[ki_match.end():].strip()
+        return _format_summary(core, n)
     # タイトル行（「〜について」等）以降を本文として使う
     lines = main_text.splitlines()
     start = 0
@@ -382,9 +412,16 @@ def make_summary(main_text: str, n: int) -> str:
         if re.search(r"について|に関する|に関して|に係る", s) and 10 <= len(s) <= 200:
             start = i + 1
             break
-    core = "\n".join(lines[start:])
-    s = re.sub(r"\s+", " ", core.strip())
-    return s[:n] + ("…" if len(s) > n else "")
+    # タイトル直後のヘッダー行（日付・宛先・発出者など）を追加スキップ
+    skip_end = min(len(lines), start + 15)
+    while start < skip_end:
+        s = lines[start].strip() if start < len(lines) else ""
+        if not s or len(s) < 5 or any(re.search(p, s) for p in _HEADER_PATTERNS):
+            start += 1
+        else:
+            break
+    core = "\n".join(lines[start:]).strip()
+    return _format_summary(core, n)
 
 _ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
@@ -396,13 +433,123 @@ def _xls_safe(s) -> str:
 
 def write_excel_index(outdir: str, records: List[Record]):
     if not openpyxl: return
+
+    # ── 色定義 ──────────────────────────────────────────────────
+    HEADER_BG   = PatternFill(fill_type="solid", fgColor="1E3A8A")   # 濃青
+    OK_BG       = PatternFill(fill_type="solid", fgColor="DCFCE7")   # 薄緑
+    REV_BG      = PatternFill(fill_type="solid", fgColor="FEE2E2")   # 薄赤
+    HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+    WRAP_CENTER = Alignment(horizontal="center", vertical="top", wrap_text=True)
+    WRAP_LEFT   = Alignment(horizontal="left",   vertical="top", wrap_text=True)
+
     wb = openpyxl.Workbook()
+
+    # ── シート①: 通知一覧 ──────────────────────────────────────
     ws = wb.active
-    ws.title = "Index"
-    ws.append(["タイトル(推定)", "日付(推定)", "発出者(推定)", "施設タグ", "業務タグ", "needs_review", "理由", "概要(先頭)", "元ファイル"])
+    ws.title = "通知一覧"
+
+    headers = ["No.", "タイトル(推定)", "日付(推定)", "発出者", "施設タグ", "業務タグ", "状態", "理由", "概要", "元ファイル"]
+    ws.append(headers)
+
+    # ヘッダー行の書式
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill   = HEADER_BG
+        cell.font   = HEADER_FONT
+        cell.alignment = WRAP_CENTER
+    ws.row_dimensions[1].height = 30
+
+    # データ行
+    for seq, r in enumerate(records, start=1):
+        status = "要確認" if r.needs_review else "正常"
+        summary_short = _xls_safe(r.summary[:400] if r.summary else "")
+        ws.append([
+            seq,
+            _xls_safe(r.title_guess),
+            _xls_safe(r.date_guess),
+            _xls_safe(r.issuer_guess),
+            " / ".join(r.tags_facility),
+            " / ".join(r.tags_work),
+            status,
+            _xls_safe(r.reason),
+            summary_short,
+            _xls_safe(r.relpath),
+        ])
+        row_num = seq + 1
+        fill = REV_BG if r.needs_review else OK_BG
+        for col_idx in range(1, len(headers) + 1):
+            cell = ws.cell(row=row_num, column=col_idx)
+            cell.fill = fill
+            cell.alignment = WRAP_LEFT
+        # 状態列はセンタリング
+        ws.cell(row=row_num, column=7).alignment = WRAP_CENTER
+        # 「要確認」セルは赤字で強調
+        if r.needs_review:
+            ws.cell(row=row_num, column=7).font = Font(bold=True, color="DC2626")
+
+    # 列幅（近似値）
+    col_widths = [6, 42, 20, 14, 24, 24, 8, 32, 55, 50]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # フリーズとオートフィルター
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    # ── シート②: サマリー ──────────────────────────────────────
+    ws2 = wb.create_sheet("サマリー")
+    ok_count  = sum(1 for r in records if not r.needs_review)
+    rev_count = len(records) - ok_count
+
+    def _s2_header(row, label):
+        cell = ws2.cell(row=row, column=1, value=label)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = HEADER_BG
+        cell.alignment = WRAP_CENTER
+
+    ws2.append(["集計項目", "件数"])
+    _s2_header(1, "集計項目")
+    ws2.cell(row=1, column=2).font   = HEADER_FONT
+    ws2.cell(row=1, column=2).fill   = HEADER_BG
+    ws2.cell(row=1, column=2).alignment = WRAP_CENTER
+
+    ws2.append(["総ファイル数", len(records)])
+    ws2.append(["正常抽出",     ok_count])
+    ws2.append(["要確認",       rev_count])
+    ws2.append([""])
+
+    ws2.append(["施設タグ別件数", ""])
+    _s2_header(ws2.max_row, "施設タグ別件数")
+    tag_fac: Dict[str, int] = {}
     for r in records:
-        ws.append([_xls_safe(r.title_guess), _xls_safe(r.date_guess), _xls_safe(r.issuer_guess), " / ".join(r.tags_facility), " / ".join(r.tags_work), "TRUE" if r.needs_review else "FALSE", _xls_safe(r.reason), _xls_safe(r.summary), _xls_safe(r.relpath)])
-    
+        for t in r.tags_facility:
+            tag_fac[t] = tag_fac.get(t, 0) + 1
+    for t, c in sorted(tag_fac.items(), key=lambda x: -x[1]):
+        ws2.append([t, c])
+
+    ws2.append([""])
+    ws2.append(["業務タグ別件数", ""])
+    _s2_header(ws2.max_row, "業務タグ別件数")
+    tag_work: Dict[str, int] = {}
+    for r in records:
+        for t in r.tags_work:
+            tag_work[t] = tag_work.get(t, 0) + 1
+    for t, c in sorted(tag_work.items(), key=lambda x: -x[1]):
+        ws2.append([t, c])
+
+    ws2.append([""])
+    ws2.append(["要確認の理由別", ""])
+    _s2_header(ws2.max_row, "要確認の理由別")
+    reason_counts: Dict[str, int] = {}
+    for r in records:
+        if r.needs_review and r.reason:
+            reason_counts[r.reason] = reason_counts.get(r.reason, 0) + 1
+    for reason, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
+        ws2.append([reason, cnt])
+
+    ws2.column_dimensions["A"].width = 50
+    ws2.column_dimensions["B"].width = 10
+
     excel_path = os.path.join(outdir, "00_統合目次.xlsx")
     try:
         wb.save(excel_path)
@@ -803,10 +950,41 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         issuer_guess = guess_issuer(text)
         fac, work, ev = tag_text(main or text)
 
+        # ファイルサイズを取得（needs_review判定で使用）
+        file_size = os.path.getsize(get_safe_path(path))
+        text_len = len(main or text)
+
         needs_rev = False
-        if method in ("unhandled", "error") or "missing" in method or len(main or text) < min_chars:
+        if method in ("unhandled", "error") or "missing" in method:
+            # 抽出方法が見つからない・失敗した場合
             needs_rev = True
-            reason = reason or "本文が短すぎる、または画像ファイル"
+            if not reason:
+                if "xdw2text_missing" in method:
+                    reason = "DocuWorksがインストールされていないため読取不可（xdw2text.exeが必要）"
+                elif method == "unhandled":
+                    reason = f"未対応ファイル形式 ({ext})"
+                elif "pymupdf_missing" in method:
+                    reason = "PyMuPDFが未インストール（pip install PyMuPDF）"
+                elif "excel_lib_missing" in method:
+                    reason = "Excelライブラリが未インストール（pip install openpyxl xlrd）"
+                else:
+                    reason = f"抽出失敗: {method}"
+        elif ext in (".xlsx", ".xlsm", ".xls", ".csv", ".txt"):
+            # スプレッドシート・テキストは抽出成功なら文字数不問で正常とみなす
+            pass
+        elif text_len < 30:
+            # 30文字未満は確実に抽出失敗または完全な画像PDF
+            needs_rev = True
+            if ext == ".pdf" and not TESSERACT_AVAILABLE:
+                reason = "画像PDFの可能性（Tesseract OCRが未インストールのため読取不可）"
+            elif ext == ".pdf":
+                reason = "OCRを試みましたが読取できませんでした（スキャン品質が低い可能性）"
+            else:
+                reason = f"本文がほぼ空です（{text_len}文字）"
+        elif file_size > 30000 and text_len < 100:
+            # 30KB超のファイルなのに100文字未満 → 画像PDF等の可能性が高い
+            needs_rev = True
+            reason = f"ファイルサイズ({file_size // 1024}KB)に対して本文が短すぎます（{text_len}文字・画像PDF等の可能性）"
 
         summary = make_summary(main or text, int(cfg.get("summary_chars", 900)))
         payload = f"タイトル(推定): {title}\n日付(推定): {date_guess}\n発出者(推定): {issuer_guess}\n\n# 本文\n{main.strip()}"
@@ -818,7 +996,7 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
 
         records.append(Record(
             relpath=rel, ext=ext,
-            size=os.path.getsize(get_safe_path(path)),
+            size=file_size,
             mtime=os.path.getmtime(get_safe_path(path)),
             sha1=sha1, method=method, pages=pages,
             text_chars=len(text), needs_review=needs_rev, reason=reason,
@@ -837,7 +1015,8 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     review_breakdown: Dict[str, int] = {}
     for r in records:
         if r.needs_review:
-            key = r.method if ("missing" in r.method or r.method in ("unhandled", "error")) else "本文が短すぎる"
+            # 理由の先頭部分（40文字まで）をキーにして集計
+            key = r.reason[:40] if r.reason else r.method
             review_breakdown[key] = review_breakdown.get(key, 0) + 1
 
     log_lines += [
