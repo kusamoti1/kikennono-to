@@ -245,9 +245,8 @@ def extract_pdf(path: str, use_ocr: bool) -> Tuple[str, Optional[int], str]:
             page_text = page.get_text("text") or ""
             # PyMuPDF が日本語文字間にスペースを挿入する問題を修正
             # （行をまたぐ改行は残し、同一行内の不要スペースのみ除去）
+            # 日本語文字間の不要スペースを除去（数字↔日本語間は箇条書き番号等で意味があるため除去しない）
             page_text = re.sub(r'([ぁ-んァ-ン一-龥])[ \t]+([ぁ-んァ-ン一-龥])', r'\1\2', page_text)
-            page_text = re.sub(r'([ぁ-んァ-ン一-龥])[ \t]+(\d)', r'\1\2', page_text)
-            page_text = re.sub(r'(\d)[ \t]+([ぁ-んァ-ン一-龥])', r'\1\2', page_text)
             # OCR判断:
             #   use_ocr=True → 50文字未満のページにOCR（手動指定モード）
             #   use_ocr=False → 10文字未満の極端に空なページにのみ自動OCR（画像PDF自動検出）
@@ -257,9 +256,8 @@ def extract_pdf(path: str, use_ocr: bool) -> Tuple[str, Optional[int], str]:
                     pix = page.get_pixmap(dpi=200)
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     ocr_text = pytesseract.image_to_string(img, lang="jpn")
+                    # OCRテキストの日本語文字間スペースを除去
                     ocr_text = re.sub(r'([ぁ-んァ-ン一-龥])\s+([ぁ-んァ-ン一-龥])', r'\1\2', ocr_text)
-                    ocr_text = re.sub(r'([ぁ-んァ-ン一-龥])\s+(\d)', r'\1\2', ocr_text)
-                    ocr_text = re.sub(r'(\d)\s+([ぁ-んァ-ン一-龥])', r'\1\2', ocr_text)
                     if ocr_text.strip():
                         # 完全に空だったページはOCR結果で置換、テキストがあった場合は追記
                         page_text = ocr_text if len(page_text.strip()) < 10 else page_text + "\n" + ocr_text
@@ -439,7 +437,8 @@ _HEADER_PATTERNS = (
     # 「消防危第」「消防予第」等を正しく検出（[危予施立]に危を追加）
     r"^[消総危]防[危予施立]?第",
     # OCR化けで先頭にゴミ文字が付いた文書番号行も拾う（例: "ロロ消防危第284号"）
-    r"消防[危予施立]?第\s*\d+号",
+    # 号の前後にスペースが入ることがあるので \s* を追加
+    r"消防[危予施立]?第\s*\d+\s*号",
     r"^\d{4}年", r"^令和|^平成|^昭和",
     r"各都道府県|各消防本部|各市町村", r"殿\s*$", r"御中\s*$",
     r"^消防庁|^総務省|^危険物保安室|^予防課", r"官印省略",
@@ -457,19 +456,34 @@ def guess_title(text: str, fallback: str) -> str:
     # 複数行にまたがるタイトルにも対応（前行と結合して判定）
     for i, line in enumerate(lines[:100]):
         s = line.strip()
-        if 10 <= len(s) <= 200:
-            if any(re.search(pat, s) for pat in _TITLE_ENDINGS):
-                # 前行が短くヘッダーでない場合は結合してタイトルを補完
-                if i > 0:
-                    prev = lines[i - 1].strip()
-                    if (5 <= len(prev) <= 100
-                            and not any(re.search(p, prev) for p in _HEADER_PATTERNS)
-                            and not _MID_SENTENCE_RE.match(prev)
-                            and not any(re.search(pat, prev) for pat in _TITLE_ENDINGS)):
-                        combined = prev + s
-                        if len(combined) <= 200:
-                            return combined
-                return s
+
+        # タイトル末尾パターンに一致する行（10文字以上）
+        if 10 <= len(s) <= 200 and any(re.search(pat, s) for pat in _TITLE_ENDINGS):
+            # 前行がヘッダーでなく意味のある行なら結合してタイトルを補完
+            if i > 0:
+                prev = lines[i - 1].strip()
+                if (5 <= len(prev) <= 100
+                        and not any(re.search(p, prev) for p in _HEADER_PATTERNS)
+                        and not _MID_SENTENCE_RE.match(prev)
+                        and not any(re.search(pat, prev) for pat in _TITLE_ENDINGS)):
+                    combined = prev + s
+                    if len(combined) <= 200:
+                        return combined
+            return s
+
+        # タイトル末尾パターンに一致するが短い行（< 10文字）→ 前行と結合
+        # 例: 前行 "新型コロナウイルス感染症の感染拡大防止に伴う危険物施設の保安体制"
+        #     + 当行 "の確保について"（8文字）
+        if 3 <= len(s) <= 9 and any(re.search(pat, s) for pat in _TITLE_ENDINGS):
+            if i > 0:
+                prev = lines[i - 1].strip()
+                if (5 <= len(prev) <= 150
+                        and not any(re.search(p, prev) for p in _HEADER_PATTERNS)
+                        and not _MID_SENTENCE_RE.match(prev)):
+                    combined = prev + s
+                    if 10 <= len(combined) <= 200:
+                        return combined
+
         # 短い行（< 10文字）が続いて次行でタイトルが完結するケースも結合して確認
         if 3 <= len(s) < 10 and i + 1 < len(lines):
             next_s = lines[i + 1].strip()
@@ -479,7 +493,8 @@ def guess_title(text: str, fallback: str) -> str:
                     return combined
 
     # パターン2: ヘッダー行・文中断片をスキップして最初の意味のある行を取る
-    for line in lines[:80]:
+    # 次行と結合してタイトルになるケースも拾う（「〜配布に」+「ついて」等）
+    for li, line in enumerate(lines[:80]):
         s = line.strip()
         if len(s) < 8 or len(s) > 150:
             continue
@@ -490,6 +505,12 @@ def guess_title(text: str, fallback: str) -> str:
         # 助詞・接続詞・読点で始まる行は文章の途中の断片 → スキップ
         if _MID_SENTENCE_RE.match(s):
             continue
+        # 次行と結合するとタイトルになる場合は結合版を返す
+        if li + 1 < len(lines):
+            next_s = lines[li + 1].strip()
+            combined = s + next_s
+            if len(combined) <= 200 and any(re.search(pat, combined) for pat in _TITLE_ENDINGS):
+                return combined
         return s
     return fallback
 
@@ -518,67 +539,291 @@ def tag_text(text: str) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
 
 def _normalize_line(s: str) -> str:
     """PDF抽出由来の行内スペースを正規化する"""
-    # 日本語文字間・日本語-数字間の不要スペースを除去
+    # 日本語文字間の不要スペースを除去（例: "令 和 3 年" → "令和3年"）
+    # ※ 数字↔日本語間のスペースは箇条書き番号等で意味があるので除去しない
     s = re.sub(r'([ぁ-んァ-ン一-龥])[ \t]+([ぁ-んァ-ン一-龥])', r'\1\2', s)
-    s = re.sub(r'([ぁ-んァ-ン一-龥])[ \t]+(\d)', r'\1\2', s)
-    s = re.sub(r'(\d)[ \t]+([ぁ-んァ-ン一-龥])', r'\1\2', s)
-    # 連続する半角スペースを1つに（全角スペースは保持）
+    # 連続する半角スペースを1つに（全角スペース・先頭インデントは保持）
     s = re.sub(r'[ \t]{2,}', ' ', s)
     return s
 
 
+# ── 箇条書き番号の先頭パターン（階層構造を保持するために使う） ──
+# 例: 「１」「（１）」「ア」「(ア)」「①」「・」「(1)」「1.」等
+_BULLET_RE = re.compile(
+    r"^[\s　]*(?:"
+    r"[①-⑳]|"                          # 丸数字 ①②…
+    r"[１-９０][０-９]*[．.、]|"          # 全角数字+句点
+    r"（[１-９０ア-ン一-龥]{1,3}）|"     # （全角）
+    r"\([1-9ア-ンa-z]{1,3}\)|"          # (半角)
+    r"[ア-ン][．.、\s]|"                 # カタカナ+句点
+    r"[a-zA-Z][．.、\s]|"               # アルファベット
+    r"[・•◆▶▷]\s"                      # 中黒・記号
+    r")"
+)
+
+# ── OCRゴミ行のパターン（校閲官合意：除去対象） ──
+_GARBAGE_LINE_RE = re.compile(
+    r"^[\s　]*(?:"
+    r"[■□◆◇▲△▼▽●○◎★☆※＊〒]{1,3}|"   # 記号のみ行
+    r"[-─━=＝]{4,}|"                     # 罫線のみ行
+    r"[・\-]{3,}"                         # 点線・ハイフン3個以上
+    r")[\s　]*$"
+)
+
+# ── 終端行パターン ──
+_TERMINATOR_RE = re.compile(
+    r"^\s*(以上|以下余白|（了）|－\s*了\s*－|【以上】|〔以上〕)\s*$"
+)
+
+# ── フッター行パターン（担当者・問い合わせ先・ページ番号等） ──
+_FOOTER_LINE_RE = re.compile(
+    r"担当(?:係)?[:：]|問い?合わせ(?:先)?[:：]|電話[:：]|FAX[:：]|℡|"
+    r"〒\d{3}|Tel\.|問合せ|照会先|内線|直通|^\s*[－\-]\s*\d+\s*[－\-]\s*$"
+)
+
+# ── 趣旨文の末尾パターン（日本の公文書定型：「通知する。」等で終わる行） ──
+_INTENT_SENTENCE_END_RE = re.compile(
+    r"(通知する|通知します|伝達する|送付する|連絡する|回答する|依頼する"
+    r"|お知らせする|お伝えする|送付します|依頼します)。?\s*$"
+)
+
+# ── 施行日・適用日のパターン ──
+_ENFORCEMENT_DATE_RE = re.compile(
+    r"(?:施行|適用|公布|発効|実施|以降|より)"
+    r".{0,6}"
+    r"(?:令和|平成|昭和)\s*[0-9元]+\s*年\s*\d+\s*月\s*\d+\s*日"
+    r"|"
+    r"(?:令和|平成|昭和)\s*[0-9元]+\s*年\s*\d+\s*月\s*\d+\s*日"
+    r".{0,10}(?:施行|適用|公布|発効|以降|から)"
+)
+
+
+def _is_garbage_line(s: str) -> bool:
+    """OCRゴミ・孤立記号・罫線などの除去すべき行か判定する"""
+    if not s:
+        return False
+    # 1〜2文字のみ（記号・数字・カナ等）は除去
+    if len(s) <= 2 and re.match(r"^[^\u3041-\u9FFF]*$", s):
+        return True
+    if _GARBAGE_LINE_RE.match(s):
+        return True
+    return False
+
+
+def _is_header_or_footer(s: str) -> bool:
+    """ヘッダー（発出者・宛先・文書番号）またはフッター行か判定する"""
+    return bool(
+        any(re.search(p, s) for p in _HEADER_PATTERNS)
+        or _FOOTER_LINE_RE.search(s)
+    )
+
+
+def _join_short_continuation_lines(lines: List[str]) -> List[str]:
+    """
+    PDF抽出で途切れた短い行を次行と連結する。
+    ─ 校閲官合意ルール ─
+    ・ゴミ行・終端行は連結しない（そのまま渡して後段でフィルタ）
+    ・行末が句読点「。」「、」で終わっている → 完結行なので連結しない
+    ・行頭が箇条書き番号 → 新項目の開始なので連結しない
+    ・行の長さが10文字未満かつ上記に該当しない → 次行の先頭に連結
+    """
+    result: List[str] = []
+    i = 0
+    while i < len(lines):
+        s = lines[i]
+        # ゴミ行・終端行はそのまま（次行と混ぜない）
+        if _is_garbage_line(s) or _TERMINATOR_RE.match(s):
+            result.append(s)
+            i += 1
+            continue
+        # 短い行で、次行があり、箇条書き番号で始まらず、句点で終わらない → 連結
+        if (len(s) < 10
+                and i + 1 < len(lines)
+                and not _BULLET_RE.match(s)
+                and not _is_garbage_line(lines[i + 1])
+                and not re.search(r"[。、」）\)]\s*$", s)):
+            result.append(s + lines[i + 1])
+            i += 2
+            continue
+        result.append(s)
+        i += 1
+    return result
+
+
+def _extract_enforcement_date(text: str) -> str:
+    """テキストから施行日・適用日を抽出して整形文字列を返す"""
+    m = _ENFORCEMENT_DATE_RE.search(text)
+    if m:
+        # 年月日部分だけ取り出す
+        date_m = re.search(
+            r"(?:令和|平成|昭和)\s*[0-9元]+\s*年\s*\d+\s*月\s*\d+\s*日",
+            m.group(0)
+        )
+        if date_m:
+            return date_m.group(0)
+    return ""
+
+
 def _format_summary(core: str, n: int) -> str:
-    """概要テキストを読みやすく整形する（空行を間引き、終端行でストップ）"""
+    """
+    概要テキストを読みやすく整形する。
+
+    ─ 専門家会議の合意設計 ─
+    1. ゴミ行・ヘッダー行・フッター行を除去
+    2. 短い途切れ行を次行と連結（箇条書き行は除外）
+    3. 連続空行を1つに間引く
+    4. 終端行（以上・了等）でストップ
+    5. 文字数上限でカット
+    """
+    # 前処理: 行ごとにスペース正規化
+    raw_lines = [_normalize_line(l.strip()) for l in core.splitlines()]
+    # 短い途切れ行を連結
+    merged = _join_short_continuation_lines(raw_lines)
+
     result_lines: List[str] = []
     char_count = 0
     prev_blank = False
-    for line in core.splitlines():
+
+    for line in merged:
         stripped = line.strip()
-        # 行内スペースを正規化（PDF抽出アーティファクト対策）
-        stripped = _normalize_line(stripped)
-        # 「以上」「以下余白」などの終端行でストップ
-        if re.match(r"^\s*(以上|以下余白|（了）|－\s*了\s*－)\s*$", stripped):
+
+        # 終端行でストップ
+        if _TERMINATOR_RE.match(stripped):
             break
+
+        # 空行処理（連続空行を1つに）
         if not stripped:
-            # 連続した空行は1つにまとめる
             if result_lines and not prev_blank:
                 result_lines.append("")
             prev_blank = True
             continue
         prev_blank = False
+
+        # OCRゴミ行・ヘッダー・フッターをスキップ
+        if _is_garbage_line(stripped):
+            continue
+        if _is_header_or_footer(stripped):
+            continue
+
         result_lines.append(stripped)
         char_count += len(stripped)
         if char_count >= n:
             break
+
     result = "\n".join(result_lines).rstrip()
     return result[:n] + ("…" if len(result) > n else "")
 
 
 def make_summary(main_text: str, n: int) -> str:
-    """通知の概要を生成する（ヘッダーをスキップして本文の要点を抽出）"""
-    # 「記」以降があればその内容を優先（日本の公文書では「記」が本文の始まりを示す）
+    """
+    危険物行政通知の概要を生成する。
+
+    ─ 専門家会議（危険物行政専門家・日本語校閲官・消防職員）合意設計 ─
+
+    【出力構造】
+      [趣旨] 本文冒頭の目的文（最大2文・150文字以内）
+             → 「〜通知する」「〜依頼する」等で終わる行まで
+      [要点] 「記」以降の本文（箇条書き番号・階層構造を保持）
+             「記」がない場合は趣旨文以降の本文
+      [施行] 施行日・適用日（自動検出時のみ末尾に付記）
+
+    【除去対象】
+      ・宛先・発出者・文書番号行（ヘッダー）
+      ・担当者・問い合わせ先行（フッター）
+      ・OCRゴミ行（1〜2文字行、記号だけの行）
+    """
+    if not main_text.strip():
+        return ""
+
+    # ── Step 1: 施行日を先にテキスト全体から抽出 ──
+    enforcement_date = _extract_enforcement_date(main_text)
+
+    # ── Step 2: 「記」の有無で分岐 ──
     ki_match = re.search(r"\n\s*記\s*\n", main_text)
+
     if ki_match:
-        core = main_text[ki_match.end():].strip()
-        return _format_summary(core, n)
-    # タイトル行（「〜について」等）以降を本文として使う
-    lines = main_text.splitlines()
-    start = 0
-    for i, line in enumerate(lines[:80]):
-        s = line.strip()
-        if re.search(r"について|に関する|に関して|に係る", s) and 10 <= len(s) <= 200:
-            start = i + 1
-            break
-    # タイトル直後のヘッダー行（日付・宛先・発出者など）を追加スキップ
-    skip_end = min(len(lines), start + 15)
-    while start < skip_end:
-        s = lines[start].strip() if start < len(lines) else ""
-        if not s or len(s) < 5 or any(re.search(p, s) for p in _HEADER_PATTERNS):
-            start += 1
+        # 【記あり】趣旨（記より前）+ 記以降の要点
+        pre_ki  = main_text[:ki_match.start()]
+        post_ki = main_text[ki_match.end():]
+
+        # 趣旨: 「〜通知する。」等の趣旨文を1〜2文だけ取る。
+        # ─ 処理方針 ─
+        # ・タイトル行（「〜について」等）はスキップ（タイトル欄に表示済み）
+        # ・宛先・発出者などのヘッダー行はスキップ
+        # ・PDFの行折り返しで分断された文を連結してから文末を判定
+        intent_buf = ""   # 行をまたいで文を連結するバッファ
+        intent_result = ""
+        for raw in pre_ki.splitlines():
+            s = _normalize_line(raw.strip())
+            if not s or _is_garbage_line(s) or _is_header_or_footer(s):
+                continue
+            intent_buf += s
+            # バッファがタイトル末尾パターンに一致したらタイトルを読み飛ばし（リセット）
+            # 例: 「〜配布に」+「ついて」→ bufが「〜配布について」でリセット
+            if any(re.search(pat, intent_buf) for pat in _TITLE_ENDINGS):
+                intent_buf = ""
+                continue
+            # 趣旨文の終わりを検出（「〜通知する。」等）
+            if _INTENT_SENTENCE_END_RE.search(intent_buf):
+                intent_result = intent_buf
+                break
+            # 句点で文が終わっていても概要文として採用
+            if re.search(r"。\s*$", intent_buf):
+                intent_result = intent_buf
+                break
+            if len(intent_buf) >= 200:
+                intent_result = intent_buf[:200]
+                break
+        intent_chars = len(intent_result)
+
+        # 要点: 記以降を整形
+        body_reserve = n - intent_chars - 10  # 趣旨分を引いた残り文字数
+        body_part = _format_summary(post_ki, max(200, body_reserve))
+
+        parts: List[str] = []
+        if intent_result:
+            parts.append(intent_result)
+        if body_part:
+            parts.append(body_part)
+        combined = "\n".join(parts)
+
+    else:
+        # 【記なし】タイトル行以降の本文を使う
+        lines = main_text.splitlines()
+        start = 0
+
+        # タイトル行（「〜について」等）を探してその次行から開始
+        for i, line in enumerate(lines[:80]):
+            s = line.strip()
+            if re.search(r"について|に関する|に関して|に係る", s) and 10 <= len(s) <= 200:
+                start = i + 1
+                break
+
+        # タイトル直後のヘッダー行をスキップ
+        skip_end = min(len(lines), start + 15)
+        while start < skip_end:
+            s = lines[start].strip() if start < len(lines) else ""
+            if not s or len(s) < 5 or _is_header_or_footer(s):
+                start += 1
+            else:
+                break
+
+        # Q&A形式の検出（問：〜 答：〜 形式）
+        body_text = "\n".join(lines[start:])
+        qa_match = re.search(r"(?:^|\n)\s*(?:問|Ｑ|Q)[　\s：:]", body_text)
+        if qa_match:
+            # Q&A形式: 「問」「答」の構造を保持してそのまま使う
+            combined = _format_summary(body_text, n)
         else:
-            break
-    core = "\n".join(lines[start:]).strip()
-    return _format_summary(core, n)
+            combined = _format_summary(body_text, n)
+
+    # ── Step 3: 施行日を末尾に付記（未包含の場合のみ） ──
+    if enforcement_date and enforcement_date not in combined:
+        suffix = f"\n【施行・適用】{enforcement_date}"
+        if len(combined) + len(suffix) <= n + 30:
+            combined += suffix
+
+    return combined[:n] + ("…" if len(combined) > n else "")
 
 _ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
