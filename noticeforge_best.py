@@ -243,6 +243,11 @@ def extract_pdf(path: str, use_ocr: bool) -> Tuple[str, Optional[int], str]:
         for i in range(pages):
             page = doc.load_page(i)
             page_text = page.get_text("text") or ""
+            # PyMuPDF が日本語文字間にスペースを挿入する問題を修正
+            # （行をまたぐ改行は残し、同一行内の不要スペースのみ除去）
+            page_text = re.sub(r'([ぁ-んァ-ン一-龥])[ \t]+([ぁ-んァ-ン一-龥])', r'\1\2', page_text)
+            page_text = re.sub(r'([ぁ-んァ-ン一-龥])[ \t]+(\d)', r'\1\2', page_text)
+            page_text = re.sub(r'(\d)[ \t]+([ぁ-んァ-ン一-龥])', r'\1\2', page_text)
             # OCR判断:
             #   use_ocr=True → 50文字未満のページにOCR（手動指定モード）
             #   use_ocr=False → 10文字未満の極端に空なページにのみ自動OCR（画像PDF自動検出）
@@ -253,6 +258,8 @@ def extract_pdf(path: str, use_ocr: bool) -> Tuple[str, Optional[int], str]:
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     ocr_text = pytesseract.image_to_string(img, lang="jpn")
                     ocr_text = re.sub(r'([ぁ-んァ-ン一-龥])\s+([ぁ-んァ-ン一-龥])', r'\1\2', ocr_text)
+                    ocr_text = re.sub(r'([ぁ-んァ-ン一-龥])\s+(\d)', r'\1\2', ocr_text)
+                    ocr_text = re.sub(r'(\d)\s+([ぁ-んァ-ン一-龥])', r'\1\2', ocr_text)
                     if ocr_text.strip():
                         # 完全に空だったページはOCR結果で置換、テキストがあった場合は追記
                         page_text = ocr_text if len(page_text.strip()) < 10 else page_text + "\n" + ocr_text
@@ -428,21 +435,50 @@ _TITLE_ENDINGS = (
 )
 # ヘッダー行の典型パターン（文書番号・日付・宛先・発出者など）
 _HEADER_PATTERNS = (
-    r"^第\d+号", r"^[消総危]防[予施立]?第", r"^\d{4}年", r"^令和|^平成|^昭和",
+    r"^第\d+号",
+    # 「消防危第」「消防予第」等を正しく検出（[危予施立]に危を追加）
+    r"^[消総危]防[危予施立]?第",
+    # OCR化けで先頭にゴミ文字が付いた文書番号行も拾う（例: "ロロ消防危第284号"）
+    r"消防[危予施立]?第\s*\d+号",
+    r"^\d{4}年", r"^令和|^平成|^昭和",
     r"各都道府県|各消防本部|各市町村", r"殿\s*$", r"御中\s*$",
     r"^消防庁|^総務省|^危険物保安室|^予防課", r"官印省略",
 )
 
+# 文章の途中（助詞・接続詞・読点）で始まる行はタイトル候補から除外する
+_MID_SENTENCE_RE = re.compile(r"^[てしがのにをはもとなかよりでもし、。・ー…「」]")
+
+
 def guess_title(text: str, fallback: str) -> str:
     """通知タイトルを推定する（「〜について」パターンを優先、ヘッダー行はスキップ）"""
     lines = text.splitlines()
+
     # パターン1: 「〜について」「〜に関する件」で終わる行を優先（通知タイトルの典型形）
-    for line in lines[:100]:
+    # 複数行にまたがるタイトルにも対応（前行と結合して判定）
+    for i, line in enumerate(lines[:100]):
         s = line.strip()
-        if 10 <= len(s) <= 150:
+        if 10 <= len(s) <= 200:
             if any(re.search(pat, s) for pat in _TITLE_ENDINGS):
+                # 前行が短くヘッダーでない場合は結合してタイトルを補完
+                if i > 0:
+                    prev = lines[i - 1].strip()
+                    if (5 <= len(prev) <= 100
+                            and not any(re.search(p, prev) for p in _HEADER_PATTERNS)
+                            and not _MID_SENTENCE_RE.match(prev)
+                            and not any(re.search(pat, prev) for pat in _TITLE_ENDINGS)):
+                        combined = prev + s
+                        if len(combined) <= 200:
+                            return combined
                 return s
-    # パターン2: ヘッダー行をスキップして最初の意味のある行を取る
+        # 短い行（< 10文字）が続いて次行でタイトルが完結するケースも結合して確認
+        if 3 <= len(s) < 10 and i + 1 < len(lines):
+            next_s = lines[i + 1].strip()
+            combined = s + next_s
+            if 10 <= len(combined) <= 200 and any(re.search(pat, combined) for pat in _TITLE_ENDINGS):
+                if not any(re.search(p, combined) for p in _HEADER_PATTERNS):
+                    return combined
+
+    # パターン2: ヘッダー行・文中断片をスキップして最初の意味のある行を取る
     for line in lines[:80]:
         s = line.strip()
         if len(s) < 8 or len(s) > 150:
@@ -450,6 +486,9 @@ def guess_title(text: str, fallback: str) -> str:
         if re.match(r"^[\d\-\s\(\)（）・ 　]+$", s):
             continue
         if any(re.search(p, s) for p in _HEADER_PATTERNS):
+            continue
+        # 助詞・接続詞・読点で始まる行は文章の途中の断片 → スキップ
+        if _MID_SENTENCE_RE.match(s):
             continue
         return s
     return fallback
@@ -477,6 +516,17 @@ def tag_text(text: str) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
     if not fac and re.search(r"危険物|消防法", target): fac.append("共通")
     return fac, work, ev
 
+def _normalize_line(s: str) -> str:
+    """PDF抽出由来の行内スペースを正規化する"""
+    # 日本語文字間・日本語-数字間の不要スペースを除去
+    s = re.sub(r'([ぁ-んァ-ン一-龥])[ \t]+([ぁ-んァ-ン一-龥])', r'\1\2', s)
+    s = re.sub(r'([ぁ-んァ-ン一-龥])[ \t]+(\d)', r'\1\2', s)
+    s = re.sub(r'(\d)[ \t]+([ぁ-んァ-ン一-龥])', r'\1\2', s)
+    # 連続する半角スペースを1つに（全角スペースは保持）
+    s = re.sub(r'[ \t]{2,}', ' ', s)
+    return s
+
+
 def _format_summary(core: str, n: int) -> str:
     """概要テキストを読みやすく整形する（空行を間引き、終端行でストップ）"""
     result_lines: List[str] = []
@@ -484,6 +534,8 @@ def _format_summary(core: str, n: int) -> str:
     prev_blank = False
     for line in core.splitlines():
         stripped = line.strip()
+        # 行内スペースを正規化（PDF抽出アーティファクト対策）
+        stripped = _normalize_line(stripped)
         # 「以上」「以下余白」などの終端行でストップ
         if re.match(r"^\s*(以上|以下余白|（了）|－\s*了\s*－)\s*$", stripped):
             break
