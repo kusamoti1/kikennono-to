@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-NoticeForge Core Logic v5.2 (Ultimate: DocuWorks/Excel-MD/LongPath/Binder)
+NoticeForge Core Logic v5.3 (Ultimate: DocuWorks/Excel-MD/LongPath/Binder)
+  v5.3: 概要生成のタイトル重複除去・目次表示改善・タイトル推定の堅牢性向上
 """
 from __future__ import annotations
 import os, sys, re, json, time, hashlib, csv, subprocess, html as _html
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional, Callable
+
+# キャッシュバージョン: 概要生成ロジックを変更した場合はインクリメントする
+# → 古いキャッシュの概要が新ロジックと不整合になるのを防止
+_CACHE_VERSION = 2
 
 # Tesseract バイナリの候補パス（複数のインストール場所に対応）
 _TESSERACT_CANDIDATES = [
@@ -478,12 +483,38 @@ def _is_meaningful_title(s: str) -> bool:
     return jp_count / len(s) >= 0.15
 
 
+def _is_similar_to_title(line: str, title: str) -> bool:
+    """概要の行がタイトルと内容的に重複しているかを判定する。
+    概要冒頭にタイトルがそのまま繰り返されるのを防止するために使う。"""
+    if not title or len(line) < 6:
+        return False
+    # 完全一致・包含関係
+    if line in title or title in line:
+        return True
+    # 空白・句読点を除去して比較
+    _strip_re = re.compile(r'[\s　、。・（）\(\)\-\—\―]')
+    clean_line = _strip_re.sub('', line)
+    clean_title = _strip_re.sub('', title)
+    if clean_title and clean_line:
+        if clean_line in clean_title or clean_title in clean_line:
+            return True
+    return False
+
+
 def guess_title(text: str, fallback: str) -> str:
     """通知タイトルを推定する（「〜について」パターンを優先、ヘッダー行はスキップ）"""
     lines = text.splitlines()
 
+    def _is_title_connectable(line_text: str) -> bool:
+        """前行・前々行がタイトルの一部として結合可能かを判定する"""
+        return (5 <= len(line_text) <= 150
+                and not any(re.search(p, line_text) for p in _HEADER_PATTERNS)
+                and not _MID_SENTENCE_RE.match(line_text)
+                and _is_meaningful_title(line_text)
+                and not any(re.search(pat, line_text) for pat in _TITLE_ENDINGS))
+
     # パターン1: 「〜について」「〜に関する件」で終わる行を優先（通知タイトルの典型形）
-    # 複数行にまたがるタイトルにも対応（前行と結合して判定）
+    # 複数行（最大3行）にまたがるタイトルにも対応
     for i, line in enumerate(lines[:100]):
         s = line.strip()
 
@@ -492,10 +523,14 @@ def guess_title(text: str, fallback: str) -> str:
             # 前行がヘッダーでなく意味のある行なら結合してタイトルを補完
             if i > 0:
                 prev = lines[i - 1].strip()
-                if (5 <= len(prev) <= 100
-                        and not any(re.search(p, prev) for p in _HEADER_PATTERNS)
-                        and not _MID_SENTENCE_RE.match(prev)
-                        and not any(re.search(pat, prev) for pat in _TITLE_ENDINGS)):
+                if _is_title_connectable(prev):
+                    # さらに前々行も結合可能か確認（3行にまたがるタイトル）
+                    if i > 1:
+                        prev2 = lines[i - 2].strip()
+                        if _is_title_connectable(prev2):
+                            combined3 = prev2 + prev + s
+                            if len(combined3) <= 200:
+                                return combined3
                     combined = prev + s
                     if len(combined) <= 200:
                         return combined
@@ -507,9 +542,14 @@ def guess_title(text: str, fallback: str) -> str:
         if 3 <= len(s) <= 9 and any(re.search(pat, s) for pat in _TITLE_ENDINGS):
             if i > 0:
                 prev = lines[i - 1].strip()
-                if (5 <= len(prev) <= 150
-                        and not any(re.search(p, prev) for p in _HEADER_PATTERNS)
-                        and not _MID_SENTENCE_RE.match(prev)):
+                if _is_title_connectable(prev):
+                    # 前々行も結合可能か確認
+                    if i > 1:
+                        prev2 = lines[i - 2].strip()
+                        if _is_title_connectable(prev2):
+                            combined3 = prev2 + prev + s
+                            if 10 <= len(combined3) <= 200:
+                                return combined3
                     combined = prev + s
                     if 10 <= len(combined) <= 200:
                         return combined
@@ -712,16 +752,17 @@ def _extract_enforcement_date(text: str) -> str:
     return ""
 
 
-def _format_summary(core: str, n: int) -> str:
+def _format_summary(core: str, n: int, title_hint: str = "") -> str:
     """
     概要テキストを読みやすく整形する。
 
     ─ 専門家会議の合意設計 ─
     1. ゴミ行・ヘッダー行・フッター行を除去
-    2. 短い途切れ行を次行と連結（箇条書き行は除外）
-    3. 連続空行を1つに間引く
-    4. 終端行（以上・了等）でストップ
-    5. 文字数上限でカット
+    2. 冒頭のタイトル行をスキップ（タイトル欄との重複を防止）
+    3. 短い途切れ行を次行と連結（箇条書き行は除外）
+    4. 連続空行を1つに間引く
+    5. 終端行（以上・了等）でストップ
+    6. 文字数上限でカット
     """
     # 前処理: 行ごとにスペース正規化
     raw_lines = [_normalize_line(l.strip()) for l in core.splitlines()]
@@ -731,6 +772,8 @@ def _format_summary(core: str, n: int) -> str:
     result_lines: List[str] = []
     char_count = 0
     prev_blank = False
+    # 冒頭フェーズ: まだ本文が始まっていない段階でタイトル行をスキップ
+    initial_phase = True
 
     for line in merged:
         stripped = line.strip()
@@ -753,6 +796,17 @@ def _format_summary(core: str, n: int) -> str:
         if _is_header_or_footer(stripped):
             continue
 
+        # 冒頭フェーズ: タイトル行が概要に重複表示されるのを防止
+        if initial_phase:
+            # タイトル末尾パターン（「〜について」等）に一致する行はスキップ
+            if any(re.search(pat, stripped) for pat in _TITLE_ENDINGS) and len(stripped) <= 200:
+                continue
+            # title_hintと内容が重複する行をスキップ
+            if title_hint and _is_similar_to_title(stripped, title_hint):
+                continue
+            # タイトルでもヘッダーでもない最初の実質行 → 本文開始
+            initial_phase = False
+
         result_lines.append(stripped)
         char_count += len(stripped)
         if char_count >= n:
@@ -762,7 +816,7 @@ def _format_summary(core: str, n: int) -> str:
     return result[:n] + ("…" if len(result) > n else "")
 
 
-def make_summary(main_text: str, n: int) -> str:
+def make_summary(main_text: str, n: int, title_hint: str = "") -> str:
     """
     危険物行政通知の概要を生成する。
 
@@ -778,6 +832,7 @@ def make_summary(main_text: str, n: int) -> str:
     【除去対象】
       ・宛先・発出者・文書番号行（ヘッダー）
       ・担当者・問い合わせ先行（フッター）
+      ・タイトル行（タイトル欄と重複するため）
       ・OCRゴミ行（1〜2文字行、記号だけの行）
     """
     if not main_text.strip():
@@ -797,6 +852,7 @@ def make_summary(main_text: str, n: int) -> str:
         # 趣旨: 「〜通知する。」等の趣旨文を1〜2文だけ取る。
         # ─ 処理方針 ─
         # ・タイトル行（「〜について」等）はスキップ（タイトル欄に表示済み）
+        # ・title_hintと一致する行もスキップ（タイトル欄との重複防止）
         # ・宛先・発出者などのヘッダー行はスキップ
         # ・PDFの行折り返しで分断された文を連結してから文末を判定
         intent_buf = ""   # 行をまたいで文を連結するバッファ
@@ -809,6 +865,10 @@ def make_summary(main_text: str, n: int) -> str:
             # バッファがタイトル末尾パターンに一致したらタイトルを読み飛ばし（リセット）
             # 例: 「〜配布に」+「ついて」→ bufが「〜配布について」でリセット
             if any(re.search(pat, intent_buf) for pat in _TITLE_ENDINGS):
+                intent_buf = ""
+                continue
+            # title_hintと重複する場合もリセット
+            if title_hint and _is_similar_to_title(intent_buf, title_hint):
                 intent_buf = ""
                 continue
             # 趣旨文の終わりを検出（「〜通知する。」等）
@@ -824,9 +884,9 @@ def make_summary(main_text: str, n: int) -> str:
                 break
         intent_chars = len(intent_result)
 
-        # 要点: 記以降を整形
+        # 要点: 記以降を整形（タイトルヒント付き）
         body_reserve = n - intent_chars - 10  # 趣旨分を引いた残り文字数
-        body_part = _format_summary(post_ki, max(200, body_reserve))
+        body_part = _format_summary(post_ki, max(200, body_reserve), title_hint=title_hint)
 
         parts: List[str] = []
         if intent_result:
@@ -846,6 +906,27 @@ def make_summary(main_text: str, n: int) -> str:
             if re.search(r"について|に関する|に関して|に係る", s) and 10 <= len(s) <= 200:
                 start = i + 1
                 break
+            # title_hintと一致する行でもタイトル行として検出
+            if title_hint and _is_similar_to_title(s, title_hint) and len(s) >= 8:
+                start = i + 1
+                break
+
+        # タイトル行が見つからなかった場合のフォールバック:
+        # 最初の意味のある非ヘッダー行をタイトルとみなし、その次から開始
+        if start == 0:
+            for i, line in enumerate(lines[:80]):
+                s = line.strip()
+                if not s or len(s) < 8 or len(s) > 150:
+                    continue
+                if any(re.search(p, s) for p in _HEADER_PATTERNS):
+                    continue
+                if _MID_SENTENCE_RE.match(s):
+                    continue
+                if not _is_meaningful_title(s):
+                    continue
+                # 最初の「意味のある非ヘッダー行」＝タイトル候補 → その次行から開始
+                start = i + 1
+                break
 
         # タイトル直後のヘッダー行をスキップ
         skip_end = min(len(lines), start + 15)
@@ -861,9 +942,9 @@ def make_summary(main_text: str, n: int) -> str:
         qa_match = re.search(r"(?:^|\n)\s*(?:問|Ｑ|Q)[　\s：:]", body_text)
         if qa_match:
             # Q&A形式: 「問」「答」の構造を保持してそのまま使う
-            combined = _format_summary(body_text, n)
+            combined = _format_summary(body_text, n, title_hint=title_hint)
         else:
-            combined = _format_summary(body_text, n)
+            combined = _format_summary(body_text, n, title_hint=title_hint)
 
     # ── Step 3: 施行日を末尾に付記（未包含の場合のみ） ──
     if enforcement_date and enforcement_date not in combined:
@@ -1152,7 +1233,7 @@ def write_html_report(outdir: str, records: List[Record]):
     for idx, r in enumerate(records):
         toc_cls  = "toc-review" if r.needs_review else "toc-ok"
         toc_icon = "⚠" if r.needs_review else "✓"
-        short_t  = r.title_guess[:28] + ("…" if len(r.title_guess) > 28 else "")
+        short_t  = r.title_guess[:40] + ("…" if len(r.title_guess) > 40 else "")
         d_str    = r.date_guess or "日付不明"
         tsearch  = (r.title_guess + " " + d_str).lower().replace('"', "")
         toc_items_html.append(
@@ -1224,7 +1305,7 @@ body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;backgrou
    左サイドバー（文書目次）
    ════════════════════════════════════ */
 .toc-sidebar{{
-  position:fixed;left:0;top:0;width:252px;height:100vh;
+  position:fixed;left:0;top:0;width:300px;height:100vh;
   background:#0f172a;color:#e2e8f0;
   display:flex;flex-direction:column;z-index:200;
   border-right:1px solid #1e3a5f;
@@ -1268,7 +1349,7 @@ body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;backgrou
 .toc-review .toc-icon{{color:#f87171}}
 .toc-body{{display:flex;flex-direction:column;min-width:0;flex:1}}
 .toc-num{{color:#64748b;font-size:10px}}
-.toc-title{{font-size:12px;color:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.toc-title{{font-size:12px;color:inherit;white-space:normal;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}}
 .toc-date{{font-size:10px;color:#64748b;margin-top:1px}}
 .toc-item.toc-hidden{{display:none}}
 .toc-empty{{padding:16px;font-size:12px;color:#475569;text-align:center}}
@@ -1276,7 +1357,7 @@ body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;backgrou
 /* ════════════════════════════════════
    メインコンテンツ
    ════════════════════════════════════ */
-.main-wrapper{{margin-left:252px}}
+.main-wrapper{{margin-left:300px}}
 
 /* ─── ページヘッダー ─── */
 .page-header{{
@@ -1611,12 +1692,18 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
 
     # マニフェスト（処理キャッシュ）を読み込む
     # → 変更のないファイルは再処理をスキップし、前回結果を再利用する
+    # ※ キャッシュバージョンが不一致の場合は全件再処理（概要ロジック変更時の整合性保証）
     manifest_path = os.path.join(outdir, "00_manifest.json")
     manifest: Dict[str, dict] = {}
     if os.path.exists(manifest_path):
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
-                manifest = json.load(f)
+                manifest_raw = json.load(f)
+            # キャッシュバージョンチェック
+            if manifest_raw.get("_cache_version") == _CACHE_VERSION:
+                manifest = {k: v for k, v in manifest_raw.items() if k != "_cache_version"}
+            else:
+                manifest = {}  # バージョン不一致 → 全件再処理
         except Exception:
             manifest = {}
 
@@ -1728,7 +1815,7 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
             needs_rev = True
             reason = f"ファイルサイズ({file_size // 1024}KB)に対して本文が短すぎます（{text_len}文字・画像PDF等の可能性）"
 
-        summary = make_summary(main or text, int(cfg.get("summary_chars", 900)))
+        summary = make_summary(main or text, int(cfg.get("summary_chars", 900)), title_hint=title)
         payload = f"タイトル(推定): {title}\n日付(推定): {date_guess}\n発出者(推定): {issuer_guess}\n\n# 本文\n{main.strip()}"
         if attach.strip(): payload += f"\n\n# 添付資料\n{attach.strip()}"
 
@@ -1779,7 +1866,7 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     # マニフェストを更新（次回の差分処理のために全レコードを保存）
     # ※ needs_review=True のファイルはキャッシュに乗せない
     #   → 次回OCRありで再処理したとき、⚠ファイルだけが自動的に再処理される
-    manifest_new: Dict[str, dict] = {}
+    manifest_new: Dict[str, dict] = {"_cache_version": _CACHE_VERSION}
     for r in records:
         if r.sha1 and not r.needs_review:
             manifest_new[r.sha1] = asdict(r)
