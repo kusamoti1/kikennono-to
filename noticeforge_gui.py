@@ -15,30 +15,37 @@ except Exception as e:
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
-APP_TITLE = "NoticeForge v5.4（NotebookLM完全版・防弾仕様）"
+APP_TITLE = "NoticeForge v6.0（法令・通知・マニュアル3層対応）"
 
 HELP_RIGHT = """ここだけ読めばOK
 
-【1】通知を入力フォルダに入れる。
+【1】入力フォルダにファイルを入れる。
+　フォルダ名で自動判別されます:
+　・「法令」→ 消防法・政令・規則等
+　・「マニュアル」→ 社内手順書等
+　・それ以外 → 通知として処理
+
+　推奨フォルダ構成:
+　  data/
+　  ├ 法令/      ← 消防法・政令・規則
+　  ├ 通知/      ← 消防庁通知
+　  └ マニュアル/ ← 社内手順書
+
 【2】画像スキャンPDFがある場合のみ
 　　「OCRを実行」にチェック。
-　　※テキスト埋め込みPDFは自動で
-　　　テキスト読取するのでチェック不要
+
 【3】「処理開始」を押す。
-※出力先は毎回リセットされます。
-※Excelを開いたままだとエラーになるので
-　閉じてから開始してください。
 
 【NotebookLMに入れるもの】
-出力フォルダにある
+出力フォルダにある全ての .txt と .md:
 ・ 00_統合目次.md
-・ NotebookLM用_統合データ_〇〇.txt
-だけをNotebookLMに入れます。
+・ 00_相互参照マップ.txt（★重要）
+・ NotebookLM用_01_法令_〇〇.txt
+・ NotebookLM用_02_通知_〇〇.txt
+・ NotebookLM用_03_マニュアル_〇〇.txt
 
 【途中で止めるには】
 「■ 止める」ボタンを押してください。
-現在のファイル処理が完了次第、
-処理を停止します。
 """
 
 class App(ctk.CTk):
@@ -63,8 +70,8 @@ class App(ctk.CTk):
 
         header = ctk.CTkFrame(self, corner_radius=0)
         header.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ctk.CTkLabel(header, text="NoticeForge v5.4", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(16, 4))
-        ctk.CTkLabel(header, text="全ファイル対応（DocuWorks/新旧Excel/PDF）→ NotebookLM用データ自動生成", text_color="gray").pack(pady=(0, 16))
+        ctk.CTkLabel(header, text="NoticeForge v6.0", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(16, 4))
+        ctk.CTkLabel(header, text="法令・通知・マニュアル3層対応 → NotebookLM用データ自動生成（相互参照マップ付き）", text_color="gray").pack(pady=(0, 16))
 
         main = ctk.CTkFrame(self, fg_color="transparent")
         main.grid(row=1, column=0, sticky="nsew", padx=(20, 10), pady=10)
@@ -75,7 +82,7 @@ class App(ctk.CTk):
         step.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         step.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(step, text="① 入力フォルダ（通知が入っているフォルダ）", font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 6))
+        ctk.CTkLabel(step, text="① 入力フォルダ（法令・通知・マニュアルが入っているフォルダ）", font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 6))
         self.in_entry = ctk.CTkEntry(step, textvariable=self.input_dir)
         self.in_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
         self.in_btn = ctk.CTkButton(step, text="フォルダを選ぶ…", width=160, command=self.pick_input)
