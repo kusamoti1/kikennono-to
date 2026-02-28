@@ -5,7 +5,7 @@ NoticeForge Core Logic v6.0 (Ultimate: 法令・通知・マニュアル3層対�
   v5.4: OCR品質スコア・構造化概要・改廃追跡・法令抽出・時系列ソート・差分レポート
 """
 from __future__ import annotations
-import os, sys, re, json, time, hashlib, csv, subprocess, html as _html
+import os, sys, re, json, time, hashlib, csv, subprocess, shutil, html as _html
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional, Callable
 
@@ -1599,6 +1599,193 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
         flush()
 
 
+def copy_source_files(indir: str, outdir: str, records: List[Record]) -> List[str]:
+    """原本PDFファイルをNotebookLM直接投入用フォルダにコピーする。
+
+    - コピー先: outdir/原本コピー/ （前回分を削除して再生成）
+    - 対象: PDFのみ（NotebookLMがネイティブに読めるファイル形式）
+    - ファイル名: 相対パスのパス区切りをアンダースコアに変換してフラット化
+    - 戻り値: コピーしたファイルのパスリスト（records のソート順＝法令→通知→マニュアル）
+    """
+    copy_dir = os.path.join(outdir, "原本コピー")
+    if os.path.isdir(copy_dir):
+        shutil.rmtree(copy_dir, ignore_errors=True)
+    os.makedirs(copy_dir, exist_ok=True)
+
+    COPYABLE_EXTS = {".pdf"}
+    copied: List[str] = []
+    used_names: set = set()
+
+    for r in records:
+        if r.ext.lower() not in COPYABLE_EXTS:
+            continue
+        src = os.path.join(indir, r.relpath)
+        if not os.path.isfile(get_safe_path(src)):
+            continue
+        # フラットなファイル名を生成（パス区切りをアンダースコアに変換）
+        safe_name = r.relpath.replace(os.sep, "_").replace("/", "_")
+        base, ext = os.path.splitext(safe_name)
+        candidate = safe_name
+        counter = 1
+        while candidate in used_names:
+            candidate = f"{base}_{counter}{ext}"
+            counter += 1
+        used_names.add(candidate)
+        dst = os.path.join(copy_dir, candidate)
+        try:
+            shutil.copy2(get_safe_path(src), dst)
+            copied.append(dst)
+        except Exception:
+            pass
+    return copied
+
+
+def write_notebook_preamble(
+    outdir: str,
+    records: List[Record],
+    bundle_files: List[str],
+    copied_files: List[str],
+) -> str:
+    """NotebookLMへの説明文書を生成する（最初にアップロードするファイル）。
+
+    テキスト抽出ファイルと原本PDFの両方が入っていること、
+    矛盾がある場合は原本を優先することを NotebookLM に明示する。
+    """
+    pdf_records = [r for r in records if r.ext.lower() == ".pdf"]
+    ocr_records = [r for r in pdf_records if r.ocr_quality < 1.0]
+    type_order = ["法令", "通知", "マニュアル"]
+    type_counts: Dict[str, int] = {}
+    for r in records:
+        type_counts[r.doc_type] = type_counts.get(r.doc_type, 0) + 1
+
+    lines: List[str] = [
+        "=" * 60,
+        "【このNotebookLMの使い方・注意事項】",
+        "（最初にこのファイルを必ずお読みください）",
+        "=" * 60,
+        "",
+        "このノートブックには以下の2種類のソースが格納されています。",
+        "",
+        "─" * 40,
+        "■ テキスト抽出ファイル（NotebookLM用_○○.txt）",
+        "─" * 40,
+        f"  {len(bundle_files)}ファイル　収録文書 {len(records)}件",
+    ]
+    for dtype in type_order:
+        if dtype in type_counts:
+            lines.append(f"  ・{dtype}: {type_counts[dtype]}件")
+    lines += [
+        "",
+        "  複数の文書を1ファイルにまとめたものです。",
+        "  PDF・Word・Excel等から自動でテキストを抽出しています。",
+    ]
+    if ocr_records:
+        lines += [
+            f"  ※ スキャンPDF {len(ocr_records)}件はOCR読取のため、",
+            "    数値・固有名詞等に誤字が含まれる可能性があります。",
+        ]
+    lines += [
+        "",
+        "─" * 40,
+        "■ 原本PDFファイル（個別にアップロード）",
+        "─" * 40,
+        f"  {len(copied_files)}ファイル",
+        "",
+        "  元のPDFをそのままアップロードしたものです。",
+        "  テキスト抽出ファイルと同じ文書の正本です。",
+        "",
+        "=" * 60,
+        "■ 回答時に必ず守ってほしい注意事項",
+        "=" * 60,
+        "",
+        "1. 数値・日付・固有名詞・法令条文番号等は",
+        "   必ず原本PDFファイルも参照して確認してください。",
+        "",
+        "2. テキストファイルと原本PDFで内容が異なる場合は、",
+        "   【原本PDFを優先】してください。",
+        "   テキストはOCR（機械読取）のため誤字が含まれる場合があります。",
+        "",
+        "3. どちらのソースを参照したかを回答に必ず明記してください。",
+        "   例：「（出典: ○○通知 原本PDF）」",
+        "",
+        "4. 確認できなかった箇所や不確かな情報には",
+        "   「要確認」と付記してください。",
+        "",
+    ]
+
+    fpath = os.path.join(outdir, "00_はじめに_NotebookLM用.txt")
+    with open(fpath, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return fpath
+
+
+def write_upload_guide(outdir: str, bundle_files: List[str], copied_files: List[str]):
+    """NotebookLMへの投入順序ガイドを生成する（00_投入ガイド.txt）。
+
+    50件制限を考慮し、説明文書→テキストバンドル→原本PDFの順で投入するよう案内する。
+    上限を超える場合は投入不可分を明示する。
+    """
+    MAX_SOURCES = 50
+    preamble_count = 1
+    total = preamble_count + len(bundle_files) + len(copied_files)
+    pdf_slots = max(MAX_SOURCES - preamble_count - len(bundle_files), 0)
+    can_upload = min(len(copied_files), pdf_slots)
+    skipped = len(copied_files) - can_upload
+
+    lines: List[str] = [
+        "=" * 60,
+        "【NotebookLMへの投入ガイド】",
+        "=" * 60,
+        "",
+        f"投入するファイル総数: {total}件",
+        f"  ・説明文書（はじめに）:  1件",
+        f"  ・テキストバンドル:  {len(bundle_files):3d}件",
+        f"  ・原本PDF:           {len(copied_files):3d}件",
+        f"NotebookLM上限:    {MAX_SOURCES}件",
+    ]
+    if total > MAX_SOURCES:
+        lines += [
+            "",
+            f"★★ 注意: 上限({MAX_SOURCES}件)を超えています ★★",
+            f"   原本PDFのうち {skipped}件は投入できません。",
+            "   下記「Step 3」で ✕ のついたファイルが投入不可分です。",
+            "   重要度の高いファイルから優先して投入してください。",
+        ]
+    lines += [
+        "",
+        "━" * 40,
+        "【投入手順】",
+        "━" * 40,
+        "",
+        "▼ Step 1: 最初に投入（必須）",
+        "  → 00_はじめに_NotebookLM用.txt",
+        "     （注意事項と使い方が書かれています）",
+        "",
+        "▼ Step 2: テキストバンドルファイルを投入",
+    ]
+    for f in bundle_files:
+        lines.append(f"  → {os.path.basename(f)}")
+    lines += [
+        "",
+        f"▼ Step 3: 原本PDFを投入（原本コピーフォルダ内）",
+        f"  ※ 上限まで残り {pdf_slots}件分のスロットがあります。",
+    ]
+    for i, f in enumerate(copied_files):
+        marker = "  → " if i < can_upload else "  ✕ "
+        lines.append(f"{marker}{os.path.basename(f)}")
+    if skipped > 0:
+        lines += [
+            "",
+            f"上記 ✕ の {skipped}件は50件制限のため投入できません。",
+            "重要度の低い文書を除外するか、複数ノートブックに分割してください。",
+        ]
+    lines.append("")
+
+    fpath = os.path.join(outdir, "00_投入ガイド.txt")
+    with open(fpath, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
 def write_cross_reference_map(outdir: str, records: List[Record]):
     """相互参照マップを生成する（人間確認用・NotebookLMには入れない）。
     通知が参照する法令条文と、法令文書を紐付ける。
@@ -2273,11 +2460,19 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         if fname.startswith("NotebookLM用_") and fname.endswith(".txt"):
             try: os.remove(os.path.join(outdir, fname))
             except Exception: pass
-    for fname in ("00_統合目次.md", "00_統合目次.xlsx", "00_人間用レポート.html", "00_処理ログ.txt", "00_相互参照マップ.txt"):
+    for fname in (
+        "00_統合目次.md", "00_統合目次.xlsx", "00_人間用レポート.html",
+        "00_処理ログ.txt", "00_相互参照マップ.txt",
+        "00_はじめに_NotebookLM用.txt", "00_投入ガイド.txt",
+    ):
         p = os.path.join(outdir, fname)
         if os.path.exists(p):
             try: os.remove(p)
             except Exception: pass
+    # 原本コピーフォルダも再生成する（前回分を削除）
+    _copy_dir = os.path.join(outdir, "原本コピー")
+    if os.path.isdir(_copy_dir):
+        shutil.rmtree(_copy_dir, ignore_errors=True)
 
     max_depth = int(cfg.get("max_depth", 30))
     split_kws = list(cfg.get("main_attach_split_keywords", []))
@@ -2489,6 +2684,13 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     records[:] = sorted_records
 
     write_binded_texts(outdir, records, limit_bytes)
+
+    # 原本PDFをコピーし、説明文書・投入ガイドを生成する
+    import glob as _glob
+    bundle_files = sorted(_glob.glob(os.path.join(outdir, "NotebookLM用_*.txt")))
+    copied_files = copy_source_files(indir, outdir, records)
+    write_notebook_preamble(outdir, records, bundle_files, copied_files)
+    write_upload_guide(outdir, bundle_files, copied_files)
 
     # サマリーを集計してログファイルに保存
     needs_rev_count = len([r for r in records if r.needs_review])
