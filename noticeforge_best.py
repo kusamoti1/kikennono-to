@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-NoticeForge Core Logic v5.4 (Ultimate: DocuWorks/Excel-MD/LongPath/Binder)
+NoticeForge Core Logic v6.0 (Ultimate: 法令・通知・マニュアル3層対応)
+  v6.0: 文書タイプ自動判別（法令/通知/マニュアル）・法令条文構造認識・相互参照マップ
   v5.4: OCR品質スコア・構造化概要・改廃追跡・法令抽出・時系列ソート・差分レポート
 """
 from __future__ import annotations
@@ -10,7 +11,7 @@ from typing import Dict, List, Tuple, Optional, Callable
 
 # キャッシュバージョン: 概要生成ロジックを変更した場合はインクリメントする
 # → 古いキャッシュの概要が新ロジックと不整合になるのを防止
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 
 # Tesseract バイナリの候補パス（複数のインストール場所に対応）
 _TESSERACT_CANDIDATES = [
@@ -239,6 +240,7 @@ class Record:
     tag_evidence: Dict[str, List[str]]
     out_txt: str
     full_text_for_bind: str = ""
+    doc_type: str = "通知"             # 文書タイプ（"法令" / "通知" / "マニュアル"）
     ocr_quality: float = 1.0          # OCR品質スコア（0.0〜1.0）
     related_laws: List[str] = None     # 関連法令（「政令第○条」等）
     amendments: List[str] = None       # 改廃情報（「〜を一部改正」等）
@@ -437,6 +439,56 @@ def split_main_attach(text: str, kws: List[str]) -> Tuple[str, str]:
         attach_text = "\n".join(lines[cut_idx:])
         return main_text.strip(), attach_text.strip()
     return text.strip(), ""
+
+# ── 文書タイプ自動判別 ──────────────────────────────────
+
+# フォルダ名による判別キーワード
+_DOCTYPE_FOLDER_LAW = re.compile(
+    r"法令|法律|政令|省令|規則|施行令|施行規則|条例|告示|訓令|条文"
+)
+_DOCTYPE_FOLDER_MANUAL = re.compile(
+    r"マニュアル|手順書|手引き|てびき|ガイド|ガイドライン|要領|要綱|内規|規程|SOP|社内|内部"
+)
+
+# 本文内容による法令判別パターン
+_LAW_ARTICLE_RE = re.compile(r"第[一二三四五六七八九十百千\d１-９０]+条")
+_LAW_NAME_PATTERNS = [
+    r"消防法", r"危険物の規制に関する政令", r"危険物の規制に関する規則",
+    r"石油コンビナート等災害防止法", r"液化石油ガスの保安の確保及び取引の適正化に関する法律",
+    r"高圧ガス保安法", r"火薬類取締法", r"建築基準法",
+]
+
+
+def _detect_doc_type(rel_path: str, text: str) -> str:
+    """文書タイプを自動判別する。
+
+    判定優先順位:
+      1. フォルダ名に法令系キーワード → "法令"
+      2. フォルダ名にマニュアル系キーワード → "マニュアル"
+      3. 本文に条文パターン（第○条）が多数 → "法令"
+      4. デフォルト → "通知"
+    """
+    # フォルダ名による判別（最優先）
+    folder_parts = rel_path.replace("\\", "/").rsplit("/", 1)
+    folder_path = folder_parts[0] if len(folder_parts) > 1 else ""
+
+    if _DOCTYPE_FOLDER_LAW.search(folder_path):
+        return "法令"
+    if _DOCTYPE_FOLDER_MANUAL.search(folder_path):
+        return "マニュアル"
+
+    # 本文内容による判別（フォルダ名が使えない場合）
+    # 条文パターンが5回以上出現 → 法令本文の可能性が高い
+    target = text[:10000]
+    article_hits = len(_LAW_ARTICLE_RE.findall(target))
+    if article_hits >= 5:
+        # 条文が多数あっても「通知する」等があれば通知
+        if re.search(r"通知する|依頼する|連絡する|送付する", target[:3000]):
+            return "通知"
+        return "法令"
+
+    return "通知"
+
 
 def convert_japanese_year(text: str) -> str:
     def replacer(match):
@@ -765,6 +817,72 @@ def guess_title(text: str, fallback: str) -> str:
         return s
     return fallback
 
+
+def guess_title_law(text: str, fallback: str) -> str:
+    """法令文書のタイトルを推定する。
+    法令名（「消防法」「危険物の規制に関する政令」等）を検出する。"""
+    lines = text.splitlines()
+
+    # パターン1: 既知の法令名を直接検出
+    known_laws = [
+        "危険物の規制に関する政令", "危険物の規制に関する規則",
+        "消防法施行令", "消防法施行規則", "消防法",
+        "石油コンビナート等災害防止法", "高圧ガス保安法",
+        "液化石油ガスの保安の確保及び取引の適正化に関する法律",
+        "火薬類取締法", "建築基準法",
+    ]
+    for i, line in enumerate(lines[:30]):
+        s = line.strip()
+        for law_name in known_laws:
+            if law_name in s and len(s) <= 80:
+                # 「〜の一部を改正する〜」のようなタイトルも拾う
+                if "改正" in s and len(s) >= 10:
+                    return s
+                return law_name
+
+    # パターン2: 「第一章 総則」等の章立てがある → その前に法令名がある
+    for i, line in enumerate(lines[:50]):
+        s = line.strip()
+        if re.match(r"^第[一二三四五六七八九十]+章", s):
+            # この行より前で最後の意味のある行が法令名
+            for j in range(i - 1, -1, -1):
+                prev = lines[j].strip()
+                if prev and len(prev) >= 4 and len(prev) <= 80:
+                    if not re.match(r"^[\d\s（）\(\)]+$", prev):
+                        return prev
+            break
+
+    # パターン3: 先頭の意味のある行を取る（法令ファイルなのでヘッダーパターンは適用しない）
+    for line in lines[:20]:
+        s = line.strip()
+        if not s or len(s) < 4 or len(s) > 80:
+            continue
+        if re.match(r"^[\d\s\-（）\(\)・ 　]+$", s):
+            continue
+        if _is_garbage_line(s):
+            continue
+        return s
+
+    return fallback
+
+
+def guess_title_manual(text: str, fallback: str) -> str:
+    """マニュアル・手順書のタイトルを推定する。"""
+    lines = text.splitlines()
+
+    # 先頭付近から最初の意味のある行を取る（ヘッダーパターンは適用しない）
+    for line in lines[:30]:
+        s = line.strip()
+        if not s or len(s) < 4 or len(s) > 120:
+            continue
+        if re.match(r"^[\d\s\-（）\(\)・ 　]+$", s):
+            continue
+        if _is_garbage_line(s):
+            continue
+        return s
+    return fallback
+
+
 def guess_date(text: str) -> str:
     m = re.search(r"(令和|平成|昭和)\s*[0-9元]+\s*年\s*\d+\s*月\s*\d+\s*日(（\d{4}年）)?", text)
     if m: return m.group(0)
@@ -863,13 +981,22 @@ def _is_garbage_line(s: str) -> bool:
         return True
     if _GARBAGE_LINE_RE.match(s):
         return True
-    # OCRゴミ検出: スペースを除いた文字が6文字以上あるのに日本語文字が一切ない
-    # 例: "NMWMMMMMUMNMNI"（全て英大文字）、"===[]==="（記号のみ）等
+    # OCRゴミ検出: スペースを除いた文字で判定
     no_space = s.replace(' ', '').replace('　', '').replace('\t', '')
-    if len(no_space) >= 6:
+    if len(no_space) >= 4:
         jp_count = len(re.findall(r'[ぁ-んァ-ン一-龥]', no_space))
-        if jp_count == 0:
-            # 数字・記号・ASCII のみ → OCRゴミとして除去
+        total = len(no_space)
+        # (1) 日本語文字が一切ない → OCRゴミ
+        if jp_count == 0 and total >= 6:
+            return True
+        # (2) 日本語比率が極端に低い（10%未満で10文字以上）→ OCR化け
+        #     例: "MNWMれMMNI" のようなケース
+        if total >= 10 and jp_count > 0 and (jp_count / total) < 0.10:
+            return True
+        # (3) 連続するASCII大文字が多い → OCR化けの典型
+        #     例: "NMWMMMMMUMNMNI" の中にカタカナ1文字混入
+        ascii_upper_runs = re.findall(r'[A-Z]{4,}', no_space)
+        if ascii_upper_runs and sum(len(r) for r in ascii_upper_runs) > total * 0.5:
             return True
     return False
 
@@ -1134,6 +1261,131 @@ def make_summary(main_text: str, n: int, title_hint: str = "",
 
     return combined[:n] + ("…" if len(combined) > n else "")
 
+
+def make_summary_law(text: str, n: int, title_hint: str = "") -> str:
+    """法令文書の概要を生成する。
+    条文構造（第○条）を認識し、目的条項・主要条文を抽出する。"""
+    if not text.strip():
+        return ""
+
+    lines = text.splitlines()
+    parts: List[str] = []
+
+    # ── 目的条項を探す（第1条 or 第一条） ──
+    purpose_text = ""
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if re.match(r"^第[一1１]条", s):
+            # 目的条の内容を収集（次の条文まで）
+            buf = [s]
+            for j in range(i + 1, min(i + 20, len(lines))):
+                next_s = lines[j].strip()
+                if re.match(r"^第[二三四五2-9２-９]", next_s):
+                    break
+                if next_s:
+                    buf.append(next_s)
+            purpose_text = "".join(buf)
+            if len(purpose_text) > 300:
+                purpose_text = purpose_text[:300] + "…"
+            break
+
+    if purpose_text:
+        parts.append(f"[目的] {purpose_text}")
+
+    # ── 章立て構造を抽出 ──
+    chapters = []
+    for line in lines:
+        s = line.strip()
+        m = re.match(r"^(第[一二三四五六七八九十百]+章)\s*(.*)", s)
+        if m:
+            chapters.append(f"{m.group(1)} {m.group(2)}")
+    if chapters:
+        parts.append("[構成]\n" + "\n".join(chapters[:15]))
+
+    # ── 主要条文の見出しを抽出 ──
+    article_heads = []
+    for line in lines:
+        s = line.strip()
+        m = re.match(r"^(第[一二三四五六七八九十百千\d１-９０]+条(?:の[一二三四五六七八九十\d１-９０]+)?)\s*[（(]([^）)]+)[）)]", s)
+        if m:
+            article_heads.append(f"{m.group(1)}（{m.group(2)}）")
+    if article_heads and not chapters:
+        parts.append("[条文構成]\n" + "\n".join(article_heads[:20]))
+
+    # ── 施行日 ──
+    enforcement_date = _extract_enforcement_date(text)
+    if enforcement_date:
+        parts.append(f"[施行日] {enforcement_date}")
+
+    if not parts:
+        # フォールバック: 先頭の意味のある内容を返す
+        return _format_summary(text, n, title_hint=title_hint)
+
+    combined = "\n".join(parts)
+    return combined[:n] + ("…" if len(combined) > n else "")
+
+
+def make_summary_manual(text: str, n: int, title_hint: str = "") -> str:
+    """マニュアル・手順書の概要を生成する。
+    構造を壊さず、冒頭の目的・対象・手順の要約を抽出する。"""
+    if not text.strip():
+        return ""
+
+    lines = text.splitlines()
+    parts: List[str] = []
+
+    # ── 目的・趣旨を探す ──
+    purpose_text = ""
+    for i, line in enumerate(lines[:100]):
+        s = line.strip()
+        if re.search(r"目的|趣旨|はじめに|概要|対象", s) and len(s) >= 4:
+            # この行以降の内容を収集
+            buf = []
+            for j in range(i + 1, min(i + 10, len(lines))):
+                next_s = lines[j].strip()
+                if not next_s:
+                    if buf:
+                        break
+                    continue
+                buf.append(next_s)
+            if buf:
+                purpose_text = "".join(buf)
+                if len(purpose_text) > 200:
+                    purpose_text = purpose_text[:200] + "…"
+                break
+
+    if purpose_text:
+        parts.append(f"[目的] {purpose_text}")
+
+    # ── 見出し構造を抽出 ──
+    headings = []
+    for line in lines[:200]:
+        s = line.strip()
+        # 番号付き見出し（「1. 」「第1章」「(1)」等）
+        if re.match(r"^(?:\d+[\.．\s]|第\d+[章節項]|[（(]\d+[）)])", s) and 5 <= len(s) <= 80:
+            headings.append(s)
+    if headings:
+        parts.append("[構成]\n" + "\n".join(headings[:15]))
+
+    if not parts:
+        # フォールバック: 冒頭の内容をそのまま返す
+        result_lines = []
+        char_count = 0
+        for line in lines:
+            s = line.strip()
+            if not s or _is_garbage_line(s):
+                continue
+            result_lines.append(s)
+            char_count += len(s)
+            if char_count >= n:
+                break
+        combined = "\n".join(result_lines)
+        return combined[:n] + ("…" if len(combined) > n else "")
+
+    combined = "\n".join(parts)
+    return combined[:n] + ("…" if len(combined) > n else "")
+
+
 _ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 def _xls_safe(s) -> str:
@@ -1155,11 +1407,11 @@ def write_excel_index(outdir: str, records: List[Record]):
 
     wb = openpyxl.Workbook()
 
-    # ── シート①: 通知一覧 ──────────────────────────────────────
+    # ── シート①: 文書一覧 ──────────────────────────────────────
     ws = wb.active
-    ws.title = "通知一覧"
+    ws.title = "文書一覧"
 
-    headers = ["No.", "タイトル(推定)", "日付(推定)", "発出者", "施設タグ", "業務タグ", "状態", "理由", "概要", "元ファイル"]
+    headers = ["No.", "タイプ", "タイトル(推定)", "日付(推定)", "発出者", "施設タグ", "業務タグ", "状態", "理由", "概要", "元ファイル"]
     ws.append(headers)
 
     # ヘッダー行の書式
@@ -1176,6 +1428,7 @@ def write_excel_index(outdir: str, records: List[Record]):
         summary_short = _xls_safe(r.summary[:400] if r.summary else "")
         ws.append([
             seq,
+            r.doc_type,
             _xls_safe(r.title_guess),
             _xls_safe(r.date_guess),
             _xls_safe(r.issuer_guess),
@@ -1192,14 +1445,15 @@ def write_excel_index(outdir: str, records: List[Record]):
             cell = ws.cell(row=row_num, column=col_idx)
             cell.fill = fill
             cell.alignment = WRAP_LEFT
-        # 状態列はセンタリング
-        ws.cell(row=row_num, column=7).alignment = WRAP_CENTER
+        # タイプ列・状態列はセンタリング
+        ws.cell(row=row_num, column=2).alignment = WRAP_CENTER
+        ws.cell(row=row_num, column=8).alignment = WRAP_CENTER
         # 「要確認」セルは赤字で強調
         if r.needs_review:
-            ws.cell(row=row_num, column=7).font = Font(bold=True, color="DC2626")
+            ws.cell(row=row_num, column=8).font = Font(bold=True, color="DC2626")
 
     # 列幅（近似値）
-    col_widths = [6, 42, 20, 14, 24, 24, 8, 32, 55, 50]
+    col_widths = [6, 10, 42, 20, 14, 24, 24, 8, 32, 55, 50]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -1269,13 +1523,20 @@ def write_excel_index(outdir: str, records: List[Record]):
 
 def write_md_indices(outdir: str, records: List[Record]):
     with open(os.path.join(outdir, "00_統合目次.md"), "w", encoding="utf-8") as f:
-        f.write("# 統合目次（概要付き・日付順）\n\n")
+        f.write("# 統合目次（法令・通知・マニュアル）\n\n")
+        current_type = ""
         for r in records:
+            # タイプが変わったらセクション見出しを出力
+            if r.doc_type != current_type:
+                current_type = r.doc_type
+                type_counts = sum(1 for x in records if x.doc_type == current_type)
+                f.write(f"## {current_type}（{type_counts}件）\n\n")
+
             laws_str = f"\n  - 関連法令: {', '.join(r.related_laws)}" if r.related_laws else ""
             amend_str = f"\n  - 改廃: {', '.join(r.amendments)}" if r.amendments else ""
             ocr_str = f"\n  - OCR品質: {r.ocr_quality:.0%}" if r.ocr_quality < 1.0 else ""
             f.write(
-                f"- **{r.title_guess}**\n"
+                f"- **[{r.doc_type}] {r.title_guess}**\n"
                 f"  - 日付: {r.date_guess} / 発出: {r.issuer_guess}\n"
                 f"  - タグ: [{'/'.join(r.tags_facility)}] [{'/'.join(r.tags_work)}]"
                 f"{laws_str}{amend_str}{ocr_str}\n"
@@ -1284,47 +1545,170 @@ def write_md_indices(outdir: str, records: List[Record]):
             )
 
 def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
-    chunk_idx = 1
-    current_size = 0
-    current_blocks: List[str] = []
-    current_toc: List[str] = []
-    doc_num = 0
+    """文書タイプ別にNotebookLM用テキストを出力する。
+    法令→通知→マニュアルの順に、タイプ別ファイル名で出力。"""
 
-    def flush():
-        nonlocal chunk_idx, current_size, current_blocks, current_toc
-        if not current_blocks: return
-        toc_header = (
-            "【このファイルの収録文書一覧】\n"
-            + "\n".join(current_toc)
-            + f"\n（以上 {len(current_toc)} 件）\n\n" + "=" * 60 + "\n"
-        )
-        with open(os.path.join(outdir, f"NotebookLM用_統合データ_{chunk_idx:02d}.txt"), "w", encoding="utf-8") as f:
-            f.write(toc_header + "\n".join(current_blocks))
-        chunk_idx += 1
-        current_size = 0
-        current_blocks = []
-        current_toc = []
-
+    # タイプ別にグループ化（出力順: 法令 → 通知 → マニュアル）
+    type_order = {"法令": 1, "通知": 2, "マニュアル": 3}
+    type_groups: Dict[str, List[Record]] = {"法令": [], "通知": [], "マニュアル": []}
     for r in records:
-        if not r.full_text_for_bind.strip(): continue
-        doc_num += 1
-        toc_entry = f"  {doc_num:3d}. {r.title_guess}（{r.date_guess or '日付不明'}）"
-        block = (
-            f"\n\n{'='*60}\n"
-            f"【文書 No.{doc_num}】\n"
-            f"元ファイル: {r.relpath}\n"
-            f"タイトル: {r.title_guess}\n"
-            f"日付: {r.date_guess or '不明'} / 発出: {r.issuer_guess or '不明'}\n"
-            f"{'-'*60}\n"
-            f"{r.full_text_for_bind}\n"
-            f"{'='*60}\n\n"
-        )
-        b_len = len(block.encode("utf-8"))
-        if current_size + b_len > limit_bytes and current_size > 0: flush()
-        current_blocks.append(block)
-        current_toc.append(toc_entry)
-        current_size += b_len
-    flush()
+        group = r.doc_type if r.doc_type in type_groups else "通知"
+        type_groups[group].append(r)
+
+    type_prefixes = {"法令": "01_法令", "通知": "02_通知", "マニュアル": "03_マニュアル"}
+
+    for doc_type in ["法令", "通知", "マニュアル"]:
+        group_records = type_groups[doc_type]
+        if not group_records:
+            continue
+
+        prefix = type_prefixes[doc_type]
+        chunk_idx = 1
+        current_size = 0
+        current_blocks: List[str] = []
+        current_toc: List[str] = []
+        doc_num = 0
+
+        def flush(p=prefix, ci=[chunk_idx], cs=[current_size], cb=current_blocks, ct=current_toc):
+            if not cb:
+                return
+            toc_header = (
+                f"【{doc_type}】このファイルの収録文書一覧\n"
+                + "\n".join(ct)
+                + f"\n（以上 {len(ct)} 件）\n\n" + "=" * 60 + "\n"
+            )
+            fname = f"NotebookLM用_{p}_{ci[0]:02d}.txt"
+            with open(os.path.join(outdir, fname), "w", encoding="utf-8") as f:
+                f.write(toc_header + "\n".join(cb))
+            ci[0] += 1
+            cs[0] = 0
+            cb.clear()
+            ct.clear()
+
+        for r in group_records:
+            if not r.full_text_for_bind.strip():
+                continue
+            doc_num += 1
+
+            # ★ NotebookLM用テキストにはAI推定情報を入れない
+            # 元ファイルパスのみを付記（出典の追跡用）
+            toc_entry = f"  {doc_num:3d}. {r.title_guess}（{r.date_guess or '日付不明'}）"
+            block = (
+                f"\n\n{'='*60}\n"
+                f"【文書 No.{doc_num}】\n"
+                f"元ファイル: {r.relpath}\n"
+                f"{'-'*60}\n"
+                f"{r.full_text_for_bind}\n"
+                f"{'='*60}\n\n"
+            )
+            b_len = len(block.encode("utf-8"))
+            if current_size + b_len > limit_bytes and current_size > 0:
+                flush()
+            current_blocks.append(block)
+            current_toc.append(toc_entry)
+            current_size += b_len
+        flush()
+
+
+def write_cross_reference_map(outdir: str, records: List[Record]):
+    """相互参照マップを生成する（人間確認用・NotebookLMには入れない）。
+    通知が参照する法令条文と、法令文書を紐付ける。
+    ★ これは機械推定なので必ず人間が確認すること。"""
+
+    law_records = [r for r in records if r.doc_type == "法令"]
+    notice_records = [r for r in records if r.doc_type == "通知"]
+    manual_records = [r for r in records if r.doc_type == "マニュアル"]
+
+    lines: List[str] = []
+    lines.append("=" * 60)
+    lines.append("【相互参照マップ】法令・通知・マニュアルの関連付け")
+    lines.append("=" * 60)
+    lines.append("")
+    lines.append("★★★ 注意 ★★★")
+    lines.append("このファイルの内容は機械（テキストパターン）による推定です。")
+    lines.append("間違いが含まれている可能性があります。")
+    lines.append("必ず人間が確認してから利用してください。")
+    lines.append("")
+    lines.append("【NotebookLMへの入力について】")
+    lines.append("このファイルの内容を確認し、間違いがなければNotebookLMに入れて")
+    lines.append("ください。間違いがあればその部分を修正するか、このファイルは")
+    lines.append("NotebookLMに入れずに参考資料としてのみ利用してください。")
+    lines.append("")
+    lines.append(f"法令: {len(law_records)}件 / 通知: {len(notice_records)}件 / マニュアル: {len(manual_records)}件")
+    lines.append("")
+
+    # ── 法令一覧 ──
+    if law_records:
+        lines.append("-" * 40)
+        lines.append("■ 収録法令一覧")
+        lines.append("-" * 40)
+        for r in law_records:
+            lines.append(f"  ・{r.title_guess}（{r.date_guess or '日付不明'}）")
+        lines.append("")
+
+    # ── 通知→法令の参照関係 ──
+    if notice_records:
+        lines.append("-" * 40)
+        lines.append("■ 通知から法令への参照関係")
+        lines.append("-" * 40)
+        for r in notice_records:
+            if r.related_laws:
+                lines.append(f"  [{r.date_guess or '日付不明'}] {r.title_guess}")
+                for law_ref in r.related_laws:
+                    # 参照先の法令文書が存在するか確認
+                    matched_law = ""
+                    for lr in law_records:
+                        if any(keyword in lr.title_guess for keyword in _extract_law_keywords(law_ref)):
+                            matched_law = f" → 収録済み: {lr.title_guess}"
+                            break
+                    lines.append(f"    → {law_ref}{matched_law}")
+                if r.amendments:
+                    for a in r.amendments:
+                        lines.append(f"    [改廃] {a}")
+                lines.append("")
+
+    # ── マニュアル一覧 ──
+    if manual_records:
+        lines.append("-" * 40)
+        lines.append("■ 社内マニュアル一覧")
+        lines.append("-" * 40)
+        for r in manual_records:
+            ref_str = ""
+            if r.related_laws:
+                ref_str = f" → 関連法令: {', '.join(r.related_laws[:3])}"
+            lines.append(f"  ・{r.title_guess}{ref_str}")
+        lines.append("")
+
+    # ── 法令条文→通知の逆引き ──
+    if law_records and notice_records:
+        lines.append("-" * 40)
+        lines.append("■ 法令条文から通知への逆引き（どの条文にどの通知が関連するか）")
+        lines.append("-" * 40)
+        # 法令条文をキーにして通知をグループ化
+        law_to_notices: Dict[str, List[str]] = {}
+        for r in notice_records:
+            for law_ref in r.related_laws:
+                if law_ref not in law_to_notices:
+                    law_to_notices[law_ref] = []
+                law_to_notices[law_ref].append(f"{r.title_guess}（{r.date_guess or ''}）")
+        for law_ref, notices in sorted(law_to_notices.items()):
+            lines.append(f"  {law_ref}:")
+            for notice_title in notices[:10]:
+                lines.append(f"    ← {notice_title}")
+        lines.append("")
+
+    content = "\n".join(lines)
+    with open(os.path.join(outdir, "00_相互参照マップ.txt"), "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def _extract_law_keywords(law_ref: str) -> List[str]:
+    """法令参照文字列からマッチング用キーワードを抽出する"""
+    keywords = []
+    for name in ["消防法", "政令", "規則", "省令", "条例", "告示"]:
+        if name in law_ref:
+            keywords.append(name)
+    return keywords if keywords else [law_ref[:4]]
 
 def compute_sha1(path: str) -> str:
     """ファイルのSHA1ハッシュを計算して重複ファイル検出に使う"""
@@ -1412,6 +1796,20 @@ def write_html_report(outdir: str, records: List[Record]):
         for k, c in sorted(review_reasons.items(), key=lambda x: -x[1])[:5]
     )
 
+    # ─── 文書タイプ別集計 ────────────────────────────────────────────
+    dtype_counts: Dict[str, int] = {}
+    for r in records:
+        dtype_counts[r.doc_type] = dtype_counts.get(r.doc_type, 0) + 1
+    _dtype_css = {"法令": "law", "通知": "notice", "マニュアル": "manual"}
+    dtype_breakdown_parts = [
+        f'<span class="type-chip dtype-{_dtype_css.get(dt, "notice")}">{esc(dt)} <b>{cnt}</b>件</span>'
+        for dt, cnt in [("法令", dtype_counts.get("法令", 0)),
+                        ("通知", dtype_counts.get("通知", 0)),
+                        ("マニュアル", dtype_counts.get("マニュアル", 0))]
+        if cnt > 0
+    ]
+    dtype_breakdown_html = "".join(dtype_breakdown_parts)
+
     # ─── バッジ色 ─────────────────────────────────────────────────
     FAC_COLOR  = "#2563eb"
     WORK_COLOR = "#16a34a"
@@ -1454,6 +1852,10 @@ def write_html_report(outdir: str, records: List[Record]):
             f'<div class="reason-box">⚠ {esc(r.reason)}</div>' if r.reason else ""
         )
 
+        # 文書タイプバッジ
+        dtype_cls = {"法令": "dtype-law", "通知": "dtype-notice", "マニュアル": "dtype-manual"}.get(r.doc_type, "dtype-notice")
+        dtype_badge_html = f'<span class="dtype-badge {dtype_cls}">{esc(r.doc_type)}</span>'
+
         # OCR品質バッジ（OCR処理したファイルのみ表示）
         ocr_badge_html = ""
         if r.ocr_quality < 1.0:
@@ -1478,7 +1880,7 @@ def write_html_report(outdir: str, records: List[Record]):
 
         search_data = " ".join([
             r.title_guess, r.summary, r.relpath,
-            r.date_guess, r.issuer_guess,
+            r.date_guess, r.issuer_guess, r.doc_type,
             " ".join(r.tags_facility), " ".join(r.tags_work),
             " ".join(r.related_laws), " ".join(r.amendments),
             r.reason, r.method,
@@ -1489,7 +1891,7 @@ def write_html_report(outdir: str, records: List[Record]):
 <div id="card-{idx}" class="card {card_cls}" data-search="{esc(search_data.lower())}">
   <div class="card-header">
     <div class="card-title">{esc(r.title_guess)}</div>
-    <div class="card-badges">{ocr_badge_html}{rev_badge}</div>
+    <div class="card-badges">{dtype_badge_html}{ocr_badge_html}{rev_badge}</div>
   </div>
   <div class="meta">
     <span>📅 {date_str}</span>
@@ -1685,6 +2087,10 @@ body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;backgrou
 .amend-row,.law-row{{font-size:12px;color:#475569;margin-bottom:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}}
 .amend-chip{{background:#fef3c7;color:#92400e;border:1px solid #fde68a;border-radius:4px;padding:1px 8px;font-size:11px}}
 .law-chip{{background:#ede9fe;color:#6d28d9;border:1px solid #c4b5fd;border-radius:4px;padding:1px 8px;font-size:11px}}
+.dtype-badge{{border-radius:6px;padding:2px 10px;font-size:11px;font-weight:bold;white-space:nowrap}}
+.dtype-law{{background:#dbeafe;color:#1d4ed8;border:1px solid #93c5fd}}
+.dtype-notice{{background:#f0fdf4;color:#15803d;border:1px solid #86efac}}
+.dtype-manual{{background:#fef3c7;color:#92400e;border:1px solid #fcd34d}}
 
 /* ─── フッター ─── */
 .footer{{text-align:center;color:#94a3b8;font-size:11px;padding:24px;margin-top:8px}}
@@ -1747,6 +2153,10 @@ body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;backgrou
     </div>
     <div class="overview-bottom">
       <div class="type-section">
+        <div class="type-label">文書タイプ</div>
+        <div class="type-chips">{dtype_breakdown_html}</div>
+      </div>
+      <div class="type-section">
         <div class="type-label">ファイル種別</div>
         <div class="type-chips">{ext_breakdown_html}</div>
       </div>
@@ -1758,9 +2168,10 @@ body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;backgrou
     </div>
     <div class="guide-box">
       💡 <span><strong>NotebookLMへの入力：</strong>
-      出力フォルダの「00_統合目次.md」と「NotebookLM用_統合データ_○○.txt」を
-      NotebookLMにアップロードしてください。
-      「要確認」ファイルは目次に含まれますが、本文の精度が低い場合があります。</span>
+      「NotebookLM用_○○.txt」を全てアップロードしてください（これが本文です）。
+      「00_相互参照マップ.txt」は<strong>機械推定</strong>なので、
+      中身を確認して間違いがなければ入れてください。間違いがあれば入れないでください。
+      NotebookLMはソースの内容をそのまま引用するため、間違った情報を入れると誤った回答の原因になります。</span>
     </div>
   </section>
 
@@ -1870,10 +2281,10 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     # 前回の生成ファイルを削除（古いデータがNotebookLMに混入しないように）
     # ※ 00_manifest.json だけは差分処理のために残す
     for fname in os.listdir(outdir):
-        if fname.startswith("NotebookLM用_統合データ_") and fname.endswith(".txt"):
+        if fname.startswith("NotebookLM用_") and fname.endswith(".txt"):
             try: os.remove(os.path.join(outdir, fname))
             except Exception: pass
-    for fname in ("00_統合目次.md", "00_統合目次.xlsx", "00_人間用レポート.html", "00_処理ログ.txt"):
+    for fname in ("00_統合目次.md", "00_統合目次.xlsx", "00_人間用レポート.html", "00_処理ログ.txt", "00_相互参照マップ.txt"):
         p = os.path.join(outdir, fname)
         if os.path.exists(p):
             try: os.remove(p)
@@ -1998,7 +2409,18 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
 
         text = convert_japanese_year(text)
         main, attach = split_main_attach(text, split_kws)
-        title = guess_title(main or text, os.path.basename(path))
+
+        # ── 文書タイプ自動判別 ──
+        doc_type = _detect_doc_type(rel, main or text)
+
+        # ── タイプ別タイトル推定 ──
+        if doc_type == "法令":
+            title = guess_title_law(main or text, os.path.basename(path))
+        elif doc_type == "マニュアル":
+            title = guess_title_manual(main or text, os.path.basename(path))
+        else:
+            title = guess_title(main or text, os.path.basename(path))
+
         date_guess = guess_date(text)
         issuer_guess = guess_issuer(text)
         fac, work, ev = tag_text(main or text)
@@ -2050,12 +2472,26 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
             needs_rev = True
             reason = f"OCR品質が低い（スコア: {ocr_q}）。元ファイルの目視確認を推奨"
 
-        summary = make_summary(main or text, int(cfg.get("summary_chars", 900)),
-                               title_hint=title, ocr_quality=ocr_q)
-        payload = f"タイトル(推定): {title}\n日付(推定): {date_guess}\n発出者(推定): {issuer_guess}\n\n# 本文\n{main.strip()}"
-        if attach.strip(): payload += f"\n\n# 添付資料\n{attach.strip()}"
+        # ── タイプ別概要生成 ──
+        summary_chars = int(cfg.get("summary_chars", 900))
+        if doc_type == "法令":
+            summary = make_summary_law(main or text, summary_chars, title_hint=title)
+        elif doc_type == "マニュアル":
+            summary = make_summary_manual(main or text, summary_chars, title_hint=title)
+        else:
+            summary = make_summary(main or text, summary_chars,
+                                   title_hint=title, ocr_quality=ocr_q)
 
-        log_lines.append(f"[{method}] {rel}" + (f"  OCR品質:{ocr_q}" if ocr_q < 1.0 else ""))
+        # ── ペイロード（NotebookLM用テキスト）──
+        # ★重要: NotebookLMに渡すテキストにはAI推定情報を入れない
+        # NotebookLMは入力ソースだけを参照するため、推定が間違っていると
+        # NotebookLMが誤情報を「事実」として引用してしまう。
+        # タイトル・日付・発出者は本文中に元々含まれているのでそのまま渡す。
+        payload = f"# 本文\n{main.strip()}"
+        if attach.strip():
+            payload += f"\n\n# 添付資料\n{attach.strip()}"
+
+        log_lines.append(f"[{method}][{doc_type}] {rel}" + (f"  OCR品質:{ocr_q}" if ocr_q < 1.0 else ""))
         if reason:
             log_lines.append(f"  → {reason}")
 
@@ -2068,16 +2504,28 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
             title_guess=title, date_guess=date_guess, issuer_guess=issuer_guess,
             summary=summary, tags_facility=fac, tags_work=work, tag_evidence=ev,
             out_txt="", full_text_for_bind=payload,
+            doc_type=doc_type,
             ocr_quality=ocr_q, related_laws=related_laws, amendments=amendments,
             date_sort_key=date_sort,
         ))
 
-    # ── 時系列ソート（日付の新しい順） ──
-    records.sort(key=lambda r: r.date_sort_key, reverse=True)
+    # ── タイプ別＋時系列ソート（法令→通知→マニュアル、各タイプ内は日付新しい順）──
+    type_sort_order = {"法令": 0, "通知": 1, "マニュアル": 2}
+    records.sort(key=lambda r: (type_sort_order.get(r.doc_type, 9), r.date_sort_key), reverse=False)
+    # 日付は新しい順にしたいので、タイプ内で逆順にする
+    records.sort(key=lambda r: type_sort_order.get(r.doc_type, 9))
+    # タイプ別にグループ化してから日付ソート
+    sorted_records: List[Record] = []
+    for dtype in ["法令", "通知", "マニュアル"]:
+        group = [r for r in records if r.doc_type == dtype]
+        group.sort(key=lambda r: r.date_sort_key, reverse=True)
+        sorted_records.extend(group)
+    records[:] = sorted_records
 
     write_excel_index(outdir, records)
     write_md_indices(outdir, records)
     write_binded_texts(outdir, records, limit_bytes)
+    write_cross_reference_map(outdir, records)
     write_html_report(outdir, records)
 
     # サマリーを集計してログファイルに保存
@@ -2089,10 +2537,16 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
             key = r.reason[:40] if r.reason else r.method
             review_breakdown[key] = review_breakdown.get(key, 0) + 1
 
+    # 文書タイプ別集計
+    dtype_log: Dict[str, int] = {}
+    for r in records:
+        dtype_log[r.doc_type] = dtype_log.get(r.doc_type, 0) + 1
+
     log_lines += [
         "",
         "--- サマリー ---",
         f"総処理数: {len(records)} 件（うちキャッシュ利用: {skipped_cache} 件）",
+        f"文書タイプ別: " + " / ".join(f"{k}: {v}件" for k, v in dtype_log.items()),
         f"正常抽出: {len(records) - needs_rev_count} 件",
         f"要確認: {needs_rev_count} 件",
     ]
