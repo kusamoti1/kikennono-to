@@ -15,7 +15,7 @@ except Exception as e:
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
-APP_TITLE = "NoticeForge v5.3（NotebookLM完全版・防弾仕様）"
+APP_TITLE = "NoticeForge v5.4（NotebookLM完全版・防弾仕様）"
 
 HELP_RIGHT = """ここだけ読めばOK
 
@@ -63,7 +63,7 @@ class App(ctk.CTk):
 
         header = ctk.CTkFrame(self, corner_radius=0)
         header.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ctk.CTkLabel(header, text="NoticeForge v5.3", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(16, 4))
+        ctk.CTkLabel(header, text="NoticeForge v5.4", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(16, 4))
         ctk.CTkLabel(header, text="全ファイル対応（DocuWorks/新旧Excel/PDF）→ NotebookLM用データ自動生成", text_color="gray").pack(pady=(0, 16))
 
         main = ctk.CTkFrame(self, fg_color="transparent")
