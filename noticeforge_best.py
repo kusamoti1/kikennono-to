@@ -84,10 +84,16 @@ def _setup_xdw_dll_path():
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\FUJIFILM\DocuWorks"),
+            # DocuWorks Viewer Light 専用キー（Viewer Lightはフルとは別キーに登録されることがある）
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks Viewer Light"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\FUJIFILM\DocuWorks Viewer Light"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fuji Xerox\DocuWorks Viewer Light"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks Viewer Light"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fujitsu\DocuWorks"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fujitsu\DocuWorks"),
             (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Fuji Xerox\DocuWorks"),
             (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\FUJIFILM\DocuWorks"),
+            (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\FUJIFILM\DocuWorks Viewer Light"),
         ]
         for hive, key_path in reg_keys:
             try:
@@ -104,14 +110,24 @@ def _setup_xdw_dll_path():
                 continue
 
         for pattern in [
+            # DocuWorks フル版
             r"C:\Program Files\Fuji Xerox\DocuWorks\XDWAPI.dll",
             r"C:\Program Files\FUJIFILM\DocuWorks\XDWAPI.dll",
             r"C:\Program Files (x86)\Fuji Xerox\DocuWorks\XDWAPI.dll",
             r"C:\Program Files (x86)\FUJIFILM\DocuWorks\XDWAPI.dll",
+            # DocuWorks Viewer Light 専用パス（バージョン10等）
+            r"C:\Program Files\Fuji Xerox\DocuWorks Viewer Light\XDWAPI.dll",
+            r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light\XDWAPI.dll",
+            r"C:\Program Files (x86)\Fuji Xerox\DocuWorks Viewer Light\XDWAPI.dll",
+            r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light\XDWAPI.dll",
+            # ワイルドカードでバージョン番号付きフォルダも拾う
             r"C:\Program Files\*\DocuWorks\XDWAPI.dll",
             r"C:\Program Files (x86)\*\DocuWorks\XDWAPI.dll",
-            r"C:\Program Files\Fuji Xerox\*\XDWAPI.dll",
             r"C:\Program Files\FUJIFILM\*\XDWAPI.dll",
+            r"C:\Program Files\Fuji Xerox\*\XDWAPI.dll",
+            r"C:\Program Files (x86)\FUJIFILM\*\XDWAPI.dll",
+            r"C:\Program Files (x86)\Fuji Xerox\*\XDWAPI.dll",
+            # システム全域
             r"C:\Windows\System32\XDWAPI.dll",
             r"C:\Windows\SysWOW64\XDWAPI.dll",
         ]:
@@ -163,6 +179,11 @@ def _build_xdw2text_candidates() -> List[str]:
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\FUJIFILM\DocuWorks"),
+                # DocuWorks Viewer Light 専用キー
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks Viewer Light"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\FUJIFILM\DocuWorks Viewer Light"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fuji Xerox\DocuWorks Viewer Light"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks Viewer Light"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fujitsu\DocuWorks"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fujitsu\DocuWorks"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\TokiwaWorks\TokiwaWorks"),
@@ -209,6 +230,11 @@ def _build_xdw2text_candidates() -> List[str]:
             r"C:\Program Files (x86)\Fuji Xerox\DocuWorks\xdw2text.exe",
             r"C:\Program Files\FUJIFILM\DocuWorks\xdw2text.exe",
             r"C:\Program Files (x86)\FUJIFILM\DocuWorks\xdw2text.exe",
+            # DocuWorks Viewer Light 10 専用パス
+            r"C:\Program Files\Fuji Xerox\DocuWorks Viewer Light\xdw2text.exe",
+            r"C:\Program Files (x86)\Fuji Xerox\DocuWorks Viewer Light\xdw2text.exe",
+            r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light\xdw2text.exe",
+            r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light\xdw2text.exe",
             r"C:\Program Files\TokiwaWorks\xdw2text.exe",
             r"C:\Program Files (x86)\TokiwaWorks\xdw2text.exe",
             r"C:\Program Files\DocuWorks\xdw2text.exe",
@@ -1675,36 +1701,62 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
         flush()
 
 
-def copy_source_files(
+def copy_source_files_batched(
     indir: str,
     outdir: str,
     records: List[Record],
-    max_slots: int = 50,
-) -> Tuple[List[str], List[Tuple[str, str]]]:
-    """原本PDFファイルをNotebookLM直接投入用フォルダにコピーする。
+    slots_per_batch: int = 46,
+) -> Tuple[List[Tuple[str, List[str]]], List[Tuple[str, str]]]:
+    """原本PDFを複数のバッチフォルダに分割してコピーする（全件対応）。
 
-    NotebookLMの制限に合わせてコピーを制限する:
-      - 1ファイルあたり 50MB 以下のみコピー
-      - 合計 250MB を超えた時点で停止
-      - max_slots 件を超えた時点で停止（50件制限からバンドル数等を引いた残り）
+    NotebookLMの制限（50MB/件・250MB/ノートブック・50件制限）を守りながら、
+    全PDFを収まるだけバッチ分割して漏れなくコピーする。
+
+      - 各バッチフォルダ: 原本コピー_ノートブック01/ 〜
+      - 1ファイルあたり 50MB 超はスキップ（サイズ超過として記録）
+      - 各バッチ: max slots_per_batch 件 かつ 合計 250MB 以内
 
     戻り値:
-      copied:  コピー済みファイルのパスリスト
-      skipped: スキップしたファイルのリスト [(relpath, 理由), ...]
+      batches: [(batch_dir, [file_paths]), ...] バッチごとの (フォルダ, ファイルリスト)
+      skipped: [(relpath, 理由), ...] スキップしたファイルのリスト
     """
     MAX_FILE_BYTES  = 50  * 1024 * 1024   # 50MB / ファイル
-    MAX_TOTAL_BYTES = 250 * 1024 * 1024   # 250MB 合計
-
-    copy_dir = os.path.join(outdir, "原本コピー")
-    if os.path.isdir(copy_dir):
-        shutil.rmtree(copy_dir, ignore_errors=True)
-    os.makedirs(copy_dir, exist_ok=True)
+    MAX_BATCH_BYTES = 250 * 1024 * 1024   # 250MB / バッチ
 
     COPYABLE_EXTS = {".pdf"}
-    copied:  List[str]               = []
-    skipped: List[Tuple[str, str]]   = []
+
+    # 前回の原本コピーフォルダをすべて削除して再生成
+    for entry in os.listdir(outdir):
+        if entry.startswith("原本コピー") and os.path.isdir(os.path.join(outdir, entry)):
+            shutil.rmtree(os.path.join(outdir, entry), ignore_errors=True)
+
+    batches:  List[Tuple[str, List[str]]] = []
+    skipped:  List[Tuple[str, str]]       = []
     used_names: set = set()
-    total_bytes = 0
+
+    current_dir:   Optional[str]   = None
+    current_files: List[str]       = []
+    current_bytes: int             = 0
+    batch_num:     int             = 0
+
+    def _flush():
+        nonlocal current_dir, current_files, current_bytes
+        if current_dir and current_files:
+            batches.append((current_dir, current_files[:]))
+        current_dir   = None
+        current_files = []
+        current_bytes = 0
+
+    def _new_batch() -> str:
+        nonlocal batch_num, current_dir, current_files, current_bytes
+        _flush()
+        batch_num += 1
+        d = os.path.join(outdir, f"原本コピー_ノートブック{batch_num:02d}")
+        os.makedirs(d, exist_ok=True)
+        current_dir   = d
+        current_files = []
+        current_bytes = 0
+        return d
 
     for r in records:
         if r.ext.lower() not in COPYABLE_EXTS:
@@ -1715,22 +1767,21 @@ def copy_source_files(
 
         file_size = os.path.getsize(get_safe_path(src))
 
-        # 1ファイルの上限チェック（50MB）
+        # 50MB 超はどのバッチにも入れられない
         if file_size > MAX_FILE_BYTES:
             skipped.append((r.relpath, f"ファイルサイズ超過 ({file_size // (1024*1024)}MB > 50MB)"))
             continue
 
-        # 合計サイズ上限チェック（250MB）
-        if total_bytes + file_size > MAX_TOTAL_BYTES:
-            skipped.append((r.relpath, f"合計250MB上限のためスキップ"))
-            continue
+        # バッチが未作成、または現バッチが満杯なら新バッチ開始
+        need_new = (
+            current_dir is None
+            or len(current_files) >= slots_per_batch
+            or current_bytes + file_size > MAX_BATCH_BYTES
+        )
+        if need_new:
+            _new_batch()
 
-        # 50件スロット上限チェック
-        if len(copied) >= max_slots:
-            skipped.append((r.relpath, "50件制限のためスキップ"))
-            continue
-
-        # フラットなファイル名を生成（パス区切りをアンダースコアに変換）
+        # フラットなファイル名（パス区切り→アンダースコア）
         safe_name = r.relpath.replace(os.sep, "_").replace("/", "_")
         base, ext = os.path.splitext(safe_name)
         candidate = safe_name
@@ -1739,15 +1790,17 @@ def copy_source_files(
             candidate = f"{base}_{counter}{ext}"
             counter += 1
         used_names.add(candidate)
-        dst = os.path.join(copy_dir, candidate)
+
+        dst = os.path.join(current_dir, candidate)
         try:
             shutil.copy2(get_safe_path(src), dst)
-            copied.append(dst)
-            total_bytes += file_size
+            current_files.append(dst)
+            current_bytes += file_size
         except Exception:
             pass
 
-    return copied, skipped
+    _flush()
+    return batches, skipped
 
 
 def write_notebook_preamble(
@@ -1794,12 +1847,13 @@ def write_notebook_preamble(
             f"  ※ スキャンPDF {len(ocr_records)}件はOCR読取のため、",
             "    数値・固有名詞等に誤字が含まれる可能性があります。",
         ]
+    total_pdf = len(copied_files)
     lines += [
         "",
         "─" * 40,
         "■ 原本PDFファイル（個別にアップロード）",
         "─" * 40,
-        f"  {len(copied_files)}ファイル",
+        f"  合計 {total_pdf}ファイル（複数ノートブックに分割して投入）",
         "",
         "  元のPDFをそのままアップロードしたものです。",
         "  テキスト抽出ファイルと同じ文書の正本です。",
@@ -1832,75 +1886,63 @@ def write_notebook_preamble(
 def write_upload_guide(
     outdir: str,
     bundle_files: List[str],
-    copied_files: List[str],
+    batches: List[Tuple[str, List[str]]],
     skipped_files: Optional[List[Tuple[str, str]]] = None,
 ):
     """NotebookLMへの投入順序ガイドを生成する（00_投入ガイド.txt）。
 
-    50件制限・50MB/件・250MB合計を考慮した投入手順と除外ファイル一覧を出力する。
+    原本PDFは複数バッチに分割済み。各バッチが1つのNotebookLMノートブックに対応する。
+    50件制限・50MB/件・250MB合計を守りながら全件を網羅できるよう案内する。
     """
-    MAX_SOURCES = 50
-    preamble_count = 1
-    total = preamble_count + len(bundle_files) + len(copied_files)
     skipped_files = skipped_files or []
+    total_pdf = sum(len(files) for _, files in batches)
+    nb_count = len(batches) if batches else 1
 
     lines: List[str] = [
         "=" * 60,
         "【NotebookLMへの投入ガイド】",
         "=" * 60,
         "",
-        f"投入するファイル総数: {total}件",
-        f"  ・説明文書（はじめに）:  1件",
-        f"  ・テキストバンドル:  {len(bundle_files):3d}件",
-        f"  ・原本PDF（コピー済み）:{len(copied_files):3d}件",
-        f"NotebookLM上限:    {MAX_SOURCES}件",
-    ]
-    if total > MAX_SOURCES:
-        lines += [
-            "",
-            f"★ 注意: 上限({MAX_SOURCES}件)を超えています",
-            "  重要度の高いファイルを優先してください。",
-        ]
-    if skipped_files:
-        lines += [
-            "",
-            f"除外されたPDF: {len(skipped_files)}件（原本コピーフォルダには含まれていません）",
-        ]
-    lines += [
+        f"原本PDF総数: {total_pdf}件  → {nb_count}つのノートブックに分割",
+        f"テキストバンドル: {len(bundle_files)}件（全ノートブックに投入）",
+        f"50MB超のためスキップ: {len(skipped_files)}件",
         "",
         "━" * 40,
-        "【投入手順】",
+        "【ノートブックの作り方】",
         "━" * 40,
         "",
-        "▼ Step 1: 最初に投入（必須）",
-        "  → 00_はじめに_NotebookLM用.txt",
-        "     （注意事項と使い方が書かれています）",
-        "",
-        "▼ Step 2: テキストバンドルファイルを投入",
+        "◆ テキスト専用ノートブック（全文検索・要約用）",
+        "  ① 00_はじめに_NotebookLM用.txt",
     ]
     for f in bundle_files:
-        lines.append(f"  → {os.path.basename(f)}")
-    lines += [
-        "",
-        "▼ Step 3: 原本PDFを投入（原本コピーフォルダ内・全て投入）",
-    ]
-    for f in copied_files:
-        lines.append(f"  → {os.path.basename(f)}")
+        lines.append(f"  ② {os.path.basename(f)}")
+    lines += [""]
+
+    for i, (batch_dir, files) in enumerate(batches, start=1):
+        batch_name = os.path.basename(batch_dir)
+        batch_mb = sum(
+            os.path.getsize(f) for f in files if os.path.isfile(f)
+        ) // (1024 * 1024)
+        lines += [
+            f"◆ ノートブック {i}（原本PDF照合用）← {batch_name}/ フォルダ",
+            f"  ファイル数: {len(files)}件  合計サイズ: 約{batch_mb}MB",
+            f"  ① 00_はじめに_NotebookLM用.txt（各ノートブックに必ず入れる）",
+        ]
+        for f in bundle_files:
+            lines.append(f"  ② {os.path.basename(f)}（テキストバンドル・全部入れる）")
+        lines.append(f"  ③ {batch_name}/ フォルダ内の全PDFをアップロード")
+        lines.append("")
+
     if skipped_files:
         lines += [
-            "",
             "─" * 40,
-            "【制限により除外されたPDF（NotebookLMには入れていません）】",
-            "  ※ 50MB超・合計250MB超・50件上限のいずれかに該当",
+            f"【50MB超のためスキップされたPDF: {len(skipped_files)}件】",
+            "  ※ NotebookLMのファイルサイズ上限(50MB)を超えているためコピー未実施",
             "─" * 40,
         ]
         for relpath, reason in skipped_files:
-            lines.append(f"  除外: {os.path.basename(relpath)}  （{reason}）")
-        lines += [
-            "",
-            "除外されたファイルが重要な場合は、別ノートブックに分けて投入してください。",
-        ]
-    lines.append("")
+            lines.append(f"  スキップ: {os.path.basename(relpath)}  ({reason})")
+        lines.append("")
 
     fpath = os.path.join(outdir, "00_投入ガイド.txt")
     with open(fpath, "w", encoding="utf-8") as f:
@@ -2591,9 +2633,9 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
             try: os.remove(p)
             except Exception: pass
     # 原本コピーフォルダも再生成する（前回分を削除）
-    _copy_dir = os.path.join(outdir, "原本コピー")
-    if os.path.isdir(_copy_dir):
-        shutil.rmtree(_copy_dir, ignore_errors=True)
+    for _entry in os.listdir(outdir):
+        if _entry.startswith("原本コピー") and os.path.isdir(os.path.join(outdir, _entry)):
+            shutil.rmtree(os.path.join(outdir, _entry), ignore_errors=True)
 
     max_depth = int(cfg.get("max_depth", 30))
     split_kws = list(cfg.get("main_attach_split_keywords", []))
@@ -2812,11 +2854,12 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     # 原本PDFをコピーし、説明文書・投入ガイドを生成する
     import glob as _glob
     bundle_files = sorted(_glob.glob(os.path.join(outdir, "NotebookLM用_*.txt")))
-    # 50件制限から説明文書(1件)・バンドル分を引いた残りスロットを渡す
+    # 各バッチで使えるスロット数（説明文書1件 + バンドル分を除いた残り）
     _pdf_slots = max(50 - 1 - len(bundle_files), 0)
-    copied_files, skipped_files = copy_source_files(indir, outdir, records, max_slots=_pdf_slots)
-    write_notebook_preamble(outdir, records, bundle_files, copied_files)
-    write_upload_guide(outdir, bundle_files, copied_files, skipped_files)
+    batches, skipped_files = copy_source_files_batched(indir, outdir, records, slots_per_batch=_pdf_slots)
+    all_copied = [f for _, files in batches for f in files]
+    write_notebook_preamble(outdir, records, bundle_files, all_copied)
+    write_upload_guide(outdir, bundle_files, batches, skipped_files)
 
     # サマリーを集計してログファイルに保存
     needs_rev_count = len([r for r in records if r.needs_review])
