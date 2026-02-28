@@ -39,17 +39,11 @@ HELP_RIGHT = """ここだけ読めばOK
 【NotebookLMに入れるもの】
 出力フォルダにある:
 ・ NotebookLM用_○○.txt（全て）
-
-任意（中身を確認してから）:
-・ 00_相互参照マップ.txt
-　→ 機械推定なので間違いがないか
-　　必ず確認してから入れてください
-・ 00_統合目次.md
-　→ 概要は推定です。参考程度に。
+　→ そのままNotebookLMへアップロード
 
 【OCRで処理したファイル】
-HTMLレポートで⚠マークの付いた
-ファイルは必ず中身を確認してください。
+00_処理ログ.txt で「OCR品質」の
+低いファイルを確認してください。
 OCRの読取ミスがNotebookLMに
 そのまま入ってしまいます。
 
@@ -80,7 +74,7 @@ class App(ctk.CTk):
         header = ctk.CTkFrame(self, corner_radius=0)
         header.grid(row=0, column=0, columnspan=2, sticky="ew")
         ctk.CTkLabel(header, text="NoticeForge v6.0", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(16, 4))
-        ctk.CTkLabel(header, text="法令・通知・マニュアル3層対応 → NotebookLM用データ自動生成（相互参照マップ付き）", text_color="gray").pack(pady=(0, 16))
+        ctk.CTkLabel(header, text="法令・通知・マニュアル3層対応 → NotebookLM専用データ自動生成", text_color="gray").pack(pady=(0, 16))
 
         main = ctk.CTkFrame(self, fg_color="transparent")
         main.grid(row=1, column=0, sticky="nsew", padx=(20, 10), pady=10)
@@ -160,19 +154,10 @@ class App(ctk.CTk):
         btns = ctk.CTkFrame(side, fg_color="transparent")
         btns.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
         btns.grid_columnconfigure(0, weight=1)
-        btns.grid_columnconfigure(1, weight=1)
 
-        self.open_out = ctk.CTkButton(btns, text="出力フォルダ", command=self.open_output, fg_color="#2563eb")
-        self.open_out.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.open_out = ctk.CTkButton(btns, text="出力フォルダを開く", command=self.open_output, fg_color="#2563eb")
+        self.open_out.grid(row=0, column=0, sticky="ew")
         self.open_out.configure(state="disabled")
-
-        self.open_excel = ctk.CTkButton(btns, text="Excel目次", command=self.open_excel_index, fg_color="#16a34a")
-        self.open_excel.grid(row=0, column=1, sticky="ew", padx=(6, 0))
-        self.open_excel.configure(state="disabled")
-
-        self.open_html = ctk.CTkButton(btns, text="📊 HTMLレポートを開く（人間向け）", command=self.open_html_report, fg_color="#7c3aed")
-        self.open_html.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.open_html.configure(state="disabled")
 
     def append_log(self, s: str):
         self.log.insert("end", s + "\n")
@@ -230,7 +215,6 @@ class App(ctk.CTk):
         self._stop_event = threading.Event()  # 新しいイベントでリセット
         self.set_busy(True)
         self.open_out.configure(state="disabled")
-        self.open_excel.configure(state="disabled")
         self.progress.set(0)
         self.status.configure(text="開始準備中…", text_color="gray")
         self.append_log("=== 処理開始 ===")
@@ -255,7 +239,7 @@ class App(ctk.CTk):
             total, needs, detail = core.process_folder(indir, outdir, cfg, cb, stop_event)
 
             if stop_event.is_set():
-                msg = f"処理を途中で停止しました。処理済み: {total}件 / 要確認: {needs}件\n途中結果はHTMLレポートで確認できます。"
+                msg = f"処理を途中で停止しました。処理済み: {total}件 / 要確認: {needs}件\n途中結果は出力フォルダで確認できます。"
                 self.after(0, lambda: self._done(msg, False, outdir, stopped=True))
             else:
                 detail_msg = f"\n内訳: {detail}" if detail else ""
@@ -285,29 +269,17 @@ class App(ctk.CTk):
             self.status.configure(text=msg, text_color="#f59e0b")
             self.append_log("[STOPPED] " + msg)
             self.open_out.configure(state="normal")
-            self.open_excel.configure(state="normal")
-            self.open_html.configure(state="normal")
             messagebox.showinfo("停止しました", msg)
         else:
             self.progress.set(1)
             self.status.configure(text=msg, text_color="#00aa00")
             self.append_log("[DONE] " + msg)
             self.open_out.configure(state="normal")
-            self.open_excel.configure(state="normal")
-            self.open_html.configure(state="normal")
             messagebox.showinfo("処理完了", msg)
 
     def open_output(self):
         p = self.output_dir.get()
         if p and sys.platform.startswith("win"): os.startfile(p)
-
-    def open_excel_index(self):
-        x = os.path.join(self.output_dir.get(), "00_統合目次.xlsx")
-        if os.path.exists(x) and sys.platform.startswith("win"): os.startfile(x)
-
-    def open_html_report(self):
-        h = os.path.join(self.output_dir.get(), "00_人間用レポート.html")
-        if os.path.exists(h) and sys.platform.startswith("win"): os.startfile(h)
 
 if __name__ == "__main__":
     app = App()

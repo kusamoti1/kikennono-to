@@ -11,7 +11,7 @@ from typing import Dict, List, Tuple, Optional, Callable
 
 # キャッシュバージョン: 概要生成ロジックを変更した場合はインクリメントする
 # → 古いキャッシュの概要が新ロジックと不整合になるのを防止
-_CACHE_VERSION = 4
+_CACHE_VERSION = 5
 
 # Tesseract バイナリの候補パス（複数のインストール場所に対応）
 _TESSERACT_CANDIDATES = [
@@ -1566,33 +1566,23 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
         chunk_idx = 1
         current_size = 0
         current_blocks: List[str] = []
-        current_toc: List[str] = []
         doc_num = 0
 
-        def flush(p=prefix, ci=[chunk_idx], cs=[current_size], cb=current_blocks, ct=current_toc):
+        def flush(p=prefix, ci=[chunk_idx], cs=[current_size], cb=current_blocks):
             if not cb:
                 return
-            toc_header = (
-                f"【{doc_type}】このファイルの収録文書一覧\n"
-                + "\n".join(ct)
-                + f"\n（以上 {len(ct)} 件）\n\n" + "=" * 60 + "\n"
-            )
             fname = f"NotebookLM用_{p}_{ci[0]:02d}.txt"
             with open(os.path.join(outdir, fname), "w", encoding="utf-8") as f:
-                f.write(toc_header + "\n".join(cb))
+                f.write("\n".join(cb))
             ci[0] += 1
             cs[0] = 0
             cb.clear()
-            ct.clear()
 
         for r in group_records:
             if not r.full_text_for_bind.strip():
                 continue
             doc_num += 1
 
-            # ★ NotebookLM用テキストにはAI推定情報を入れない
-            # 元ファイルパスのみを付記（出典の追跡用）
-            toc_entry = f"  {doc_num:3d}. {r.title_guess}（{r.date_guess or '日付不明'}）"
             block = (
                 f"\n\n{'='*60}\n"
                 f"【文書 No.{doc_num}】\n"
@@ -1605,7 +1595,6 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
             if current_size + b_len > limit_bytes and current_size > 0:
                 flush()
             current_blocks.append(block)
-            current_toc.append(toc_entry)
             current_size += b_len
         flush()
 
@@ -2413,26 +2402,13 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         # ── 文書タイプ自動判別 ──
         doc_type = _detect_doc_type(rel, main or text)
 
-        # ── タイプ別タイトル推定 ──
-        if doc_type == "法令":
-            title = guess_title_law(main or text, os.path.basename(path))
-        elif doc_type == "マニュアル":
-            title = guess_title_manual(main or text, os.path.basename(path))
-        else:
-            title = guess_title(main or text, os.path.basename(path))
-
-        date_guess = guess_date(text)
-        issuer_guess = guess_issuer(text)
-        fac, work, ev = tag_text(main or text)
-
         # OCR品質スコアを計算（OCR系メソッドのみ）
         ocr_q = 1.0
         if "ocr" in method:
             ocr_q = _compute_ocr_quality(text)
 
-        # 関連法令・改廃情報の抽出
-        related_laws = _extract_related_laws(main or text)
-        amendments = _extract_amendments(main or text)
+        # 日付のみ抽出（ソート用）
+        date_guess = guess_date(text)
         date_sort = _date_to_sort_key(date_guess)
 
         # ファイルサイズを取得（needs_review判定で使用）
@@ -2472,16 +2448,6 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
             needs_rev = True
             reason = f"OCR品質が低い（スコア: {ocr_q}）。元ファイルの目視確認を推奨"
 
-        # ── タイプ別概要生成 ──
-        summary_chars = int(cfg.get("summary_chars", 900))
-        if doc_type == "法令":
-            summary = make_summary_law(main or text, summary_chars, title_hint=title)
-        elif doc_type == "マニュアル":
-            summary = make_summary_manual(main or text, summary_chars, title_hint=title)
-        else:
-            summary = make_summary(main or text, summary_chars,
-                                   title_hint=title, ocr_quality=ocr_q)
-
         # ── ペイロード（NotebookLM用テキスト）──
         # ★重要: NotebookLMに渡すテキストにはAI推定情報を入れない
         # NotebookLMは入力ソースだけを参照するため、推定が間違っていると
@@ -2501,11 +2467,11 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
             mtime=os.path.getmtime(get_safe_path(path)),
             sha1=sha1, method=method, pages=pages,
             text_chars=len(text), needs_review=needs_rev, reason=reason,
-            title_guess=title, date_guess=date_guess, issuer_guess=issuer_guess,
-            summary=summary, tags_facility=fac, tags_work=work, tag_evidence=ev,
+            title_guess="", date_guess=date_guess, issuer_guess="",
+            summary="", tags_facility=[], tags_work=[], tag_evidence={},
             out_txt="", full_text_for_bind=payload,
             doc_type=doc_type,
-            ocr_quality=ocr_q, related_laws=related_laws, amendments=amendments,
+            ocr_quality=ocr_q, related_laws=[], amendments=[],
             date_sort_key=date_sort,
         ))
 
@@ -2522,11 +2488,7 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         sorted_records.extend(group)
     records[:] = sorted_records
 
-    write_excel_index(outdir, records)
-    write_md_indices(outdir, records)
     write_binded_texts(outdir, records, limit_bytes)
-    write_cross_reference_map(outdir, records)
-    write_html_report(outdir, records)
 
     # サマリーを集計してログファイルに保存
     needs_rev_count = len([r for r in records if r.needs_review])
