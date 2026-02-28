@@ -1569,21 +1569,19 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
         current_toc: List[str] = []
         doc_num = 0
 
-        def flush(p=prefix, ci=[chunk_idx], cs=[current_size], cb=current_blocks, ct=current_toc):
-            if not cb:
+        def _flush_chunk(outdir, doc_type, prefix, chunk_idx,
+                         current_blocks, current_toc):
+            """チャンクをファイルに書き出す"""
+            if not current_blocks:
                 return
             toc_header = (
-                f"【{doc_type}】このファイルの収録文書一覧\n"
-                + "\n".join(ct)
-                + f"\n（以上 {len(ct)} 件）\n\n" + "=" * 60 + "\n"
+                f"【このファイルの収録文書一覧】\n"
+                + "\n".join(current_toc)
+                + f"\n（以上 {len(current_toc)} 件）\n\n" + "=" * 60 + "\n"
             )
-            fname = f"NotebookLM用_{p}_{ci[0]:02d}.txt"
+            fname = f"NotebookLM用_{prefix}_{chunk_idx:02d}.txt"
             with open(os.path.join(outdir, fname), "w", encoding="utf-8") as f:
-                f.write(toc_header + "\n".join(cb))
-            ci[0] += 1
-            cs[0] = 0
-            cb.clear()
-            ct.clear()
+                f.write(toc_header + "\n".join(current_blocks))
 
         for r in group_records:
             if not r.full_text_for_bind.strip():
@@ -1603,11 +1601,18 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
             )
             b_len = len(block.encode("utf-8"))
             if current_size + b_len > limit_bytes and current_size > 0:
-                flush()
+                _flush_chunk(outdir, doc_type, prefix, chunk_idx,
+                             current_blocks, current_toc)
+                chunk_idx += 1
+                current_size = 0
+                current_blocks = []
+                current_toc = []
             current_blocks.append(block)
             current_toc.append(toc_entry)
             current_size += b_len
-        flush()
+
+        _flush_chunk(outdir, doc_type, prefix, chunk_idx,
+                     current_blocks, current_toc)
 
 
 def write_cross_reference_map(outdir: str, records: List[Record]):
