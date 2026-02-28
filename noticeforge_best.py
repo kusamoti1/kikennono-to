@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-NoticeForge Core Logic v5.3 (Ultimate: DocuWorks/Excel-MD/LongPath/Binder)
-  v5.3: 概要生成のタイトル重複除去・目次表示改善・タイトル推定の堅牢性向上
+NoticeForge Core Logic v5.4 (Ultimate: DocuWorks/Excel-MD/LongPath/Binder)
+  v5.4: OCR品質スコア・構造化概要・改廃追跡・法令抽出・時系列ソート・差分レポート
 """
 from __future__ import annotations
 import os, sys, re, json, time, hashlib, csv, subprocess, html as _html
@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple, Optional, Callable
 
 # キャッシュバージョン: 概要生成ロジックを変更した場合はインクリメントする
 # → 古いキャッシュの概要が新ロジックと不整合になるのを防止
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 
 # Tesseract バイナリの候補パス（複数のインストール場所に対応）
 _TESSERACT_CANDIDATES = [
@@ -239,6 +239,16 @@ class Record:
     tag_evidence: Dict[str, List[str]]
     out_txt: str
     full_text_for_bind: str = ""
+    ocr_quality: float = 1.0          # OCR品質スコア（0.0〜1.0）
+    related_laws: List[str] = None     # 関連法令（「政令第○条」等）
+    amendments: List[str] = None       # 改廃情報（「〜を一部改正」等）
+    date_sort_key: str = ""            # 日付のソートキー（YYYYMMDD形式）
+
+    def __post_init__(self):
+        if self.related_laws is None:
+            self.related_laws = []
+        if self.amendments is None:
+            self.amendments = []
 
 def get_safe_path(path: str) -> str:
     """Windowsの260文字制限(MAX_PATH)を突破するための安全なパス変換"""
@@ -451,7 +461,6 @@ _HEADER_PATTERNS = (
     # 「消防危第」「消防予第」等を正しく検出（[危予施立]に危を追加）
     r"^[消総危]防[危予施立]?第",
     # OCR化けで先頭にゴミ文字が付いた文書番号行（例: "ロロ消防危第284号"）
-    # 号の前後にスペースが入ることがあるので \s* を追加
     r"消防[危予施立]?第\s*\d+\s*号",
     r"^\d{4}年", r"^令和|^平成|^昭和",
     # 宛先・受信者（各都道府県・各指定都市・各消防本部 等）
@@ -462,10 +471,158 @@ _HEADER_PATTERNS = (
     r"^消防庁|^総務省|^危険物保安室|^予防課",
     r"^東京消防庁|^各消防本部長|^各消防署長",
     r"官印省略",
+    # 防災主管課・消防本部 等（OCR文書で宛先がタイトルに誤検出される対策）
+    r"防災主管課", r"^消防[本局]部", r"都市消防本部",
+    # 事務連絡・通知文書の定型冒頭行
+    r"^事務連絡\s*$", r"^写\s*$", r"^別記\s*$",
+)
+
+# ── 箇条書き番号で始まる行（タイトルではなく本文の項目） ──
+_NUMBERED_ITEM_RE = re.compile(
+    r"^[\s　]*(?:"
+    r"[１-９][０-９]*[\s　．.\-\)）]|"      # 全角数字で始まる項目（「１ 」「１．」等）
+    r"\d+[\s　．.\-\)）]|"                   # 半角数字で始まる項目（「1.」「1 」等）
+    r"[①-⑳]|"                               # 丸数字
+    r"（[１-９]）|"                           # （１）等
+    r"\([1-9]\)"                             # (1) 等
+    r")"
 )
 
 # 文章の途中（助詞・接続詞・読点）で始まる行はタイトル候補から除外する
 _MID_SENTENCE_RE = re.compile(r"^[てしがのにをはもとなかよりでもし、。・ー…「」]")
+
+
+def _compute_ocr_quality(text: str) -> float:
+    """OCRテキストの品質スコアを0.0〜1.0で返す。
+    高い = 良質なテキスト、低い = ゴミが多い。
+    テキストPDF・Word・Excel等はデフォルト1.0を使い、この関数はOCR結果のみに適用する。"""
+    if not text or not text.strip():
+        return 0.0
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return 0.0
+    total_chars = sum(len(l) for l in lines)
+    if total_chars == 0:
+        return 0.0
+
+    # (1) 日本語文字比率（高い方が良い）
+    jp_chars = len(re.findall(r'[ぁ-んァ-ン一-龥]', text))
+    jp_ratio = jp_chars / total_chars
+
+    # (2) ゴミ行比率（低い方が良い）
+    garbage_count = sum(1 for l in lines if _is_garbage_line(l))
+    garbage_ratio = garbage_count / len(lines)
+
+    # (3) 意味のある単語を含む行の比率（高い方が良い）
+    # 「について」「に関する」「消防」「危険物」等の通知キーワードで判定
+    _meaningful_re = re.compile(
+        r"について|に関する|通知|消防|危険物|規則|政令|省令|条例|届出|許可|検査|安全"
+    )
+    meaningful_lines = sum(1 for l in lines if _meaningful_re.search(l))
+    meaningful_ratio = meaningful_lines / len(lines)
+
+    # (4) 平均行長（極端に短い行が多い = OCR断片化）
+    avg_len = total_chars / len(lines)
+    len_score = min(1.0, avg_len / 25.0)
+
+    # 総合スコア
+    score = (jp_ratio * 0.35
+             + (1.0 - garbage_ratio) * 0.25
+             + meaningful_ratio * 0.20
+             + len_score * 0.20)
+    return round(min(1.0, max(0.0, score)), 2)
+
+
+def _is_ocr_garbled_title(s: str) -> bool:
+    """OCR由来の壊れたタイトル候補を拒否する。
+    例: "河顧客に自ら...", "*品としての特月 8日付け..."
+    """
+    if not s:
+        return True
+    # 先頭1〜2文字がランダムな非日本語文字（OCRゴミの典型）
+    if re.match(r'^[A-Za-z\*\#\$\@\!\?\~\^\&\%\+\=\|\\\/<>]{1,2}[ぁ-んァ-ン一-龥]', s):
+        return True
+    # 先頭が孤立した1文字の漢字/カナ + 残りの文脈と不整合
+    # 例: "河顧客に..." → "河" は前の行からの誤結合
+    if (len(s) >= 10
+            and re.match(r'^[ぁ-んァ-ン一-龥]{1}[ぁ-んァ-ン一-龥]', s)
+            and s[0] not in 'のはがをにでもとやへ各本全新旧上下前後'):
+        # 2文字目以降で明確なタイトルパターンが始まるか確認
+        rest = s[1:]
+        for pat in _TITLE_ENDINGS:
+            if re.search(pat, rest):
+                # 先頭1文字を除いてタイトルとして成立 → 先頭はOCRゴミ
+                return True
+    # 120文字超はタイトルとしては異常に長い（OCRの行結合エラーの可能性大）
+    if len(s) > 120:
+        return True
+    # 途中にOCR化けの典型パターン（ランダムな半角英字が日本語文中に混入）
+    # 例: "Sいて、可搬式の" → "S" は "さ" のOCR化け
+    fragments = re.findall(r'[A-Z][ぁ-んァ-ン一-龥]', s)
+    if len(fragments) >= 2:
+        return True
+    return False
+
+
+# ── 改廃関係の検出パターン ──
+_AMENDMENT_RE = re.compile(
+    r"(「[^」]{3,60}」\s*(?:を|の)\s*(?:一部改正|全部改正|廃止|制定|追加|削除))"
+    r"|((?:一部|全部)?(?:改正|廃止)(?:する|した|され))"
+    r"|(新たに(?:制定|公布|施行))"
+)
+
+# ── 関連法令番号の抽出パターン ──
+_LAW_REF_RE = re.compile(
+    r"(?:危険物の規制に関する)?(?:政令|規則|省令|法律|法|条例|告示|訓令)"
+    r"(?:\s*第\s*\d+\s*条(?:\s*の\s*\d+)?(?:\s*第\s*\d+\s*項)?(?:\s*第\s*\d+\s*号)?)?"
+)
+
+
+def _extract_related_laws(text: str) -> List[str]:
+    """テキストから関連法令の参照（「政令第○条」等）を抽出する"""
+    target = text[:6000]
+    hits = _LAW_REF_RE.findall(target)
+    # 重複除去して返す（出現順を維持）
+    seen = set()
+    result = []
+    for h in hits:
+        h = h.strip()
+        if h and len(h) >= 4 and h not in seen:
+            seen.add(h)
+            result.append(h)
+    return result[:10]  # 最大10件
+
+
+def _extract_amendments(text: str) -> List[str]:
+    """テキストから改廃関係の情報を抽出する"""
+    target = text[:6000]
+    hits = _AMENDMENT_RE.findall(target)
+    result = []
+    for groups in hits:
+        for g in groups:
+            g = g.strip()
+            if g and len(g) >= 4 and g not in result:
+                result.append(g)
+    return result[:5]  # 最大5件
+
+
+def _date_to_sort_key(date_str: str) -> str:
+    """日付文字列をYYYYMMDD形式のソートキーに変換する"""
+    if not date_str:
+        return "99999999"
+    # 西暦表記（「2023年3月1日」）
+    m = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', date_str)
+    if m:
+        return f"{m.group(1)}{int(m.group(2)):02d}{int(m.group(3)):02d}"
+    # 和暦のカッコ内西暦（「令和5年（2023年）」等 — convert_japanese_yearで追加）
+    m = re.search(r'（(\d{4})年）', date_str)
+    if m:
+        # 月日も取る
+        md = re.search(r'(\d{1,2})\s*月\s*(\d{1,2})\s*日', date_str)
+        if md:
+            return f"{m.group(1)}{int(md.group(1)):02d}{int(md.group(2)):02d}"
+        return f"{m.group(1)}0101"
+    return "99999999"
 
 
 def _is_meaningful_title(s: str) -> bool:
@@ -502,24 +659,45 @@ def _is_similar_to_title(line: str, title: str) -> bool:
 
 
 def guess_title(text: str, fallback: str) -> str:
-    """通知タイトルを推定する（「〜について」パターンを優先、ヘッダー行はスキップ）"""
+    """通知タイトルを推定する。
+    「〜について」パターンを優先し、OCRゴミ・箇条書き番号・ヘッダー行を厳密に拒否する。"""
     lines = text.splitlines()
 
     def _is_title_connectable(line_text: str) -> bool:
         """前行・前々行がタイトルの一部として結合可能かを判定する"""
-        return (5 <= len(line_text) <= 150
+        return (5 <= len(line_text) <= 120
                 and not any(re.search(p, line_text) for p in _HEADER_PATTERNS)
                 and not _MID_SENTENCE_RE.match(line_text)
+                and not _NUMBERED_ITEM_RE.match(line_text)
                 and _is_meaningful_title(line_text)
+                and not _is_ocr_garbled_title(line_text)
                 and not any(re.search(pat, line_text) for pat in _TITLE_ENDINGS))
+
+    def _validate_title(candidate: str) -> Optional[str]:
+        """タイトル候補の最終バリデーション（OCRゴミ・異常長を拒否）"""
+        if not candidate or len(candidate) > 120:
+            return None
+        if _is_ocr_garbled_title(candidate):
+            return None
+        if _NUMBERED_ITEM_RE.match(candidate):
+            return None
+        if not _is_meaningful_title(candidate):
+            return None
+        return candidate
 
     # パターン1: 「〜について」「〜に関する件」で終わる行を優先（通知タイトルの典型形）
     # 複数行（最大3行）にまたがるタイトルにも対応
     for i, line in enumerate(lines[:100]):
         s = line.strip()
 
-        # タイトル末尾パターンに一致する行（10文字以上）
-        if 10 <= len(s) <= 200 and any(re.search(pat, s) for pat in _TITLE_ENDINGS):
+        # タイトル末尾パターンに一致する行（10文字以上、120文字以内）
+        if 10 <= len(s) <= 120 and any(re.search(pat, s) for pat in _TITLE_ENDINGS):
+            # OCRゴミチェック
+            if _is_ocr_garbled_title(s):
+                continue
+            # 箇条書き番号で始まる行はタイトルではない
+            if _NUMBERED_ITEM_RE.match(s):
+                continue
             # 前行がヘッダーでなく意味のある行なら結合してタイトルを補完
             if i > 0:
                 prev = lines[i - 1].strip()
@@ -528,64 +706,62 @@ def guess_title(text: str, fallback: str) -> str:
                     if i > 1:
                         prev2 = lines[i - 2].strip()
                         if _is_title_connectable(prev2):
-                            combined3 = prev2 + prev + s
-                            if len(combined3) <= 200:
-                                return combined3
-                    combined = prev + s
-                    if len(combined) <= 200:
-                        return combined
+                            result = _validate_title(prev2 + prev + s)
+                            if result:
+                                return result
+                    result = _validate_title(prev + s)
+                    if result:
+                        return result
             return s
 
         # タイトル末尾パターンに一致するが短い行（< 10文字）→ 前行と結合
-        # 例: 前行 "新型コロナウイルス感染症の感染拡大防止に伴う危険物施設の保安体制"
-        #     + 当行 "の確保について"（8文字）
         if 3 <= len(s) <= 9 and any(re.search(pat, s) for pat in _TITLE_ENDINGS):
             if i > 0:
                 prev = lines[i - 1].strip()
                 if _is_title_connectable(prev):
-                    # 前々行も結合可能か確認
                     if i > 1:
                         prev2 = lines[i - 2].strip()
                         if _is_title_connectable(prev2):
-                            combined3 = prev2 + prev + s
-                            if 10 <= len(combined3) <= 200:
-                                return combined3
-                    combined = prev + s
-                    if 10 <= len(combined) <= 200:
-                        return combined
+                            result = _validate_title(prev2 + prev + s)
+                            if result:
+                                return result
+                    result = _validate_title(prev + s)
+                    if result:
+                        return result
 
-        # 短い行（< 10文字）が続いて次行でタイトルが完結するケースも結合して確認
+        # 短い行が続いて次行でタイトルが完結するケース
         if 3 <= len(s) < 10 and i + 1 < len(lines):
             next_s = lines[i + 1].strip()
             combined = s + next_s
-            if 10 <= len(combined) <= 200 and any(re.search(pat, combined) for pat in _TITLE_ENDINGS):
-                if not any(re.search(p, combined) for p in _HEADER_PATTERNS):
-                    return combined
+            if 10 <= len(combined) <= 120 and any(re.search(pat, combined) for pat in _TITLE_ENDINGS):
+                result = _validate_title(combined)
+                if result:
+                    return result
 
     # パターン2: ヘッダー行・文中断片をスキップして最初の意味のある行を取る
-    # 次行と結合してタイトルになるケースも拾う（「〜配布に」+「ついて」等）
     for li, line in enumerate(lines[:80]):
         s = line.strip()
-        if len(s) < 8 or len(s) > 150:
+        if len(s) < 8 or len(s) > 120:
             continue
         if re.match(r"^[\d\-\s\(\)（）・ 　]+$", s):
             continue
         if any(re.search(p, s) for p in _HEADER_PATTERNS):
             continue
-        # 助詞・接続詞・読点で始まる行は文章の途中の断片 → スキップ
         if _MID_SENTENCE_RE.match(s):
             continue
-        # OCRゴミ行（"NMWMMMMMUMNMNI" 等、日本語ゼロ）はタイトル候補から除外
         if not _is_meaningful_title(s):
+            continue
+        if _is_ocr_garbled_title(s):
+            continue
+        if _NUMBERED_ITEM_RE.match(s):
             continue
         # 次行と結合するとタイトルになる場合は結合版を返す
         if li + 1 < len(lines):
             next_s = lines[li + 1].strip()
             combined = s + next_s
-            if (_is_meaningful_title(combined)
-                    and len(combined) <= 200
-                    and any(re.search(pat, combined) for pat in _TITLE_ENDINGS)):
-                return combined
+            result = _validate_title(combined)
+            if result and any(re.search(pat, combined) for pat in _TITLE_ENDINGS):
+                return result
         return s
     return fallback
 
@@ -816,7 +992,8 @@ def _format_summary(core: str, n: int, title_hint: str = "") -> str:
     return result[:n] + ("…" if len(result) > n else "")
 
 
-def make_summary(main_text: str, n: int, title_hint: str = "") -> str:
+def make_summary(main_text: str, n: int, title_hint: str = "",
+                 ocr_quality: float = 1.0) -> str:
     """
     危険物行政通知の概要を生成する。
 
@@ -824,10 +1001,8 @@ def make_summary(main_text: str, n: int, title_hint: str = "") -> str:
 
     【出力構造】
       [趣旨] 本文冒頭の目的文（最大2文・150文字以内）
-             → 「〜通知する」「〜依頼する」等で終わる行まで
       [要点] 「記」以降の本文（箇条書き番号・階層構造を保持）
-             「記」がない場合は趣旨文以降の本文
-      [施行] 施行日・適用日（自動検出時のみ末尾に付記）
+      [施行・適用] 施行日・適用日（自動検出時のみ末尾に付記）
 
     【除去対象】
       ・宛先・発出者・文書番号行（ヘッダー）
@@ -837,6 +1012,10 @@ def make_summary(main_text: str, n: int, title_hint: str = "") -> str:
     """
     if not main_text.strip():
         return ""
+
+    # OCR品質が極めて低い場合は概要を抑制
+    if ocr_quality < 0.25:
+        return "（OCR品質が低いため概要を自動生成できません。元ファイルを直接ご確認ください。）"
 
     # ── Step 1: 施行日を先にテキスト全体から抽出 ──
     enforcement_date = _extract_enforcement_date(main_text)
@@ -850,32 +1029,22 @@ def make_summary(main_text: str, n: int, title_hint: str = "") -> str:
         post_ki = main_text[ki_match.end():]
 
         # 趣旨: 「〜通知する。」等の趣旨文を1〜2文だけ取る。
-        # ─ 処理方針 ─
-        # ・タイトル行（「〜について」等）はスキップ（タイトル欄に表示済み）
-        # ・title_hintと一致する行もスキップ（タイトル欄との重複防止）
-        # ・宛先・発出者などのヘッダー行はスキップ
-        # ・PDFの行折り返しで分断された文を連結してから文末を判定
-        intent_buf = ""   # 行をまたいで文を連結するバッファ
+        intent_buf = ""
         intent_result = ""
         for raw in pre_ki.splitlines():
             s = _normalize_line(raw.strip())
             if not s or _is_garbage_line(s) or _is_header_or_footer(s):
                 continue
             intent_buf += s
-            # バッファがタイトル末尾パターンに一致したらタイトルを読み飛ばし（リセット）
-            # 例: 「〜配布に」+「ついて」→ bufが「〜配布について」でリセット
             if any(re.search(pat, intent_buf) for pat in _TITLE_ENDINGS):
                 intent_buf = ""
                 continue
-            # title_hintと重複する場合もリセット
             if title_hint and _is_similar_to_title(intent_buf, title_hint):
                 intent_buf = ""
                 continue
-            # 趣旨文の終わりを検出（「〜通知する。」等）
             if _INTENT_SENTENCE_END_RE.search(intent_buf):
                 intent_result = intent_buf
                 break
-            # 句点で文が終わっていても概要文として採用
             if re.search(r"。\s*$", intent_buf):
                 intent_result = intent_buf
                 break
@@ -885,14 +1054,14 @@ def make_summary(main_text: str, n: int, title_hint: str = "") -> str:
         intent_chars = len(intent_result)
 
         # 要点: 記以降を整形（タイトルヒント付き）
-        body_reserve = n - intent_chars - 10  # 趣旨分を引いた残り文字数
+        body_reserve = n - intent_chars - 40  # ラベル分の余裕
         body_part = _format_summary(post_ki, max(200, body_reserve), title_hint=title_hint)
 
         parts: List[str] = []
         if intent_result:
-            parts.append(intent_result)
+            parts.append(f"[趣旨] {intent_result}")
         if body_part:
-            parts.append(body_part)
+            parts.append(f"[要点]\n{body_part}")
         combined = "\n".join(parts)
 
     else:
@@ -906,13 +1075,11 @@ def make_summary(main_text: str, n: int, title_hint: str = "") -> str:
             if re.search(r"について|に関する|に関して|に係る", s) and 10 <= len(s) <= 200:
                 start = i + 1
                 break
-            # title_hintと一致する行でもタイトル行として検出
             if title_hint and _is_similar_to_title(s, title_hint) and len(s) >= 8:
                 start = i + 1
                 break
 
-        # タイトル行が見つからなかった場合のフォールバック:
-        # 最初の意味のある非ヘッダー行をタイトルとみなし、その次から開始
+        # フォールバック: 最初の意味のある非ヘッダー行をタイトルとみなす
         if start == 0:
             for i, line in enumerate(lines[:80]):
                 s = line.strip()
@@ -924,7 +1091,6 @@ def make_summary(main_text: str, n: int, title_hint: str = "") -> str:
                     continue
                 if not _is_meaningful_title(s):
                     continue
-                # 最初の「意味のある非ヘッダー行」＝タイトル候補 → その次行から開始
                 start = i + 1
                 break
 
@@ -937,19 +1103,33 @@ def make_summary(main_text: str, n: int, title_hint: str = "") -> str:
             else:
                 break
 
-        # Q&A形式の検出（問：〜 答：〜 形式）
         body_text = "\n".join(lines[start:])
-        qa_match = re.search(r"(?:^|\n)\s*(?:問|Ｑ|Q)[　\s：:]", body_text)
-        if qa_match:
-            # Q&A形式: 「問」「答」の構造を保持してそのまま使う
-            combined = _format_summary(body_text, n, title_hint=title_hint)
+        body_formatted = _format_summary(body_text, n - 20, title_hint=title_hint)
+
+        # 趣旨文を本文先頭から抽出（句点で終わる最初の文）
+        intent_part = ""
+        rest_part = body_formatted
+        for bline in body_formatted.splitlines():
+            if re.search(r"。\s*$", bline) or _INTENT_SENTENCE_END_RE.search(bline):
+                intent_part = bline
+                rest_idx = body_formatted.index(bline) + len(bline)
+                rest_part = body_formatted[rest_idx:].strip()
+                break
+
+        parts: List[str] = []
+        if intent_part:
+            parts.append(f"[趣旨] {intent_part}")
+            if rest_part:
+                parts.append(f"[要点]\n{rest_part}")
         else:
-            combined = _format_summary(body_text, n, title_hint=title_hint)
+            if body_formatted:
+                parts.append(body_formatted)
+        combined = "\n".join(parts)
 
     # ── Step 3: 施行日を末尾に付記（未包含の場合のみ） ──
     if enforcement_date and enforcement_date not in combined:
-        suffix = f"\n【施行・適用】{enforcement_date}"
-        if len(combined) + len(suffix) <= n + 30:
+        suffix = f"\n[施行・適用] {enforcement_date}"
+        if len(combined) + len(suffix) <= n + 40:
             combined += suffix
 
     return combined[:n] + ("…" if len(combined) > n else "")
@@ -1089,9 +1269,19 @@ def write_excel_index(outdir: str, records: List[Record]):
 
 def write_md_indices(outdir: str, records: List[Record]):
     with open(os.path.join(outdir, "00_統合目次.md"), "w", encoding="utf-8") as f:
-        f.write("# 統合目次（概要付き）\n\n")
+        f.write("# 統合目次（概要付き・日付順）\n\n")
         for r in records:
-            f.write(f"- **{r.title_guess}**\n  - 日付: {r.date_guess} / 発出: {r.issuer_guess}\n  - タグ: [{'/'.join(r.tags_facility)}] [{'/'.join(r.tags_work)}]\n  - 概要: {r.summary}\n  - 元: `{r.relpath}`\n\n")
+            laws_str = f"\n  - 関連法令: {', '.join(r.related_laws)}" if r.related_laws else ""
+            amend_str = f"\n  - 改廃: {', '.join(r.amendments)}" if r.amendments else ""
+            ocr_str = f"\n  - OCR品質: {r.ocr_quality:.0%}" if r.ocr_quality < 1.0 else ""
+            f.write(
+                f"- **{r.title_guess}**\n"
+                f"  - 日付: {r.date_guess} / 発出: {r.issuer_guess}\n"
+                f"  - タグ: [{'/'.join(r.tags_facility)}] [{'/'.join(r.tags_work)}]"
+                f"{laws_str}{amend_str}{ocr_str}\n"
+                f"  - 概要: {r.summary}\n"
+                f"  - 元: `{r.relpath}`\n\n"
+            )
 
 def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
     chunk_idx = 1
@@ -1263,10 +1453,34 @@ def write_html_report(outdir: str, records: List[Record]):
         reason_html = (
             f'<div class="reason-box">⚠ {esc(r.reason)}</div>' if r.reason else ""
         )
+
+        # OCR品質バッジ（OCR処理したファイルのみ表示）
+        ocr_badge_html = ""
+        if r.ocr_quality < 1.0:
+            if r.ocr_quality >= 0.6:
+                ocr_badge_html = f'<span class="ocr-badge ocr-ok">OCR品質: {r.ocr_quality:.0%}</span>'
+            elif r.ocr_quality >= 0.35:
+                ocr_badge_html = f'<span class="ocr-badge ocr-warn">OCR品質: {r.ocr_quality:.0%}</span>'
+            else:
+                ocr_badge_html = f'<span class="ocr-badge ocr-bad">OCR品質: {r.ocr_quality:.0%}</span>'
+
+        # 改廃情報（検出された場合のみ）
+        amend_html = ""
+        if r.amendments:
+            amend_items = "".join(f'<span class="amend-chip">{esc(a)}</span>' for a in r.amendments[:3])
+            amend_html = f'<div class="amend-row">改廃: {amend_items}</div>'
+
+        # 関連法令（検出された場合のみ）
+        laws_html = ""
+        if r.related_laws:
+            law_items = "".join(f'<span class="law-chip">{esc(l)}</span>' for l in r.related_laws[:5])
+            laws_html = f'<div class="law-row">関連法令: {law_items}</div>'
+
         search_data = " ".join([
             r.title_guess, r.summary, r.relpath,
             r.date_guess, r.issuer_guess,
             " ".join(r.tags_facility), " ".join(r.tags_work),
+            " ".join(r.related_laws), " ".join(r.amendments),
             r.reason, r.method,
         ]).replace('"', '')
         summary_html = (esc(r.summary)
@@ -1275,7 +1489,7 @@ def write_html_report(outdir: str, records: List[Record]):
 <div id="card-{idx}" class="card {card_cls}" data-search="{esc(search_data.lower())}">
   <div class="card-header">
     <div class="card-title">{esc(r.title_guess)}</div>
-    {rev_badge}
+    <div class="card-badges">{ocr_badge_html}{rev_badge}</div>
   </div>
   <div class="meta">
     <span>📅 {date_str}</span>
@@ -1284,6 +1498,8 @@ def write_html_report(outdir: str, records: List[Record]):
     <span class="method-tag">抽出: {esc(r.method)}</span>
   </div>
   <div class="tags">{tags_html}</div>
+  {amend_html}
+  {laws_html}
   <div class="summary">{summary_html}</div>
   <div class="filepath">📁 {esc(r.relpath)}</div>
   {reason_html}
@@ -1461,6 +1677,14 @@ body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;backgrou
 }}
 .filepath{{font-size:11px;color:#94a3b8;font-family:'Consolas','Courier New',monospace;word-break:break-all}}
 .reason-box{{margin-top:8px;font-size:12px;color:#92400e;background:#fffbeb;border:1px solid #fde68a;border-radius:5px;padding:6px 12px}}
+.card-badges{{display:flex;gap:6px;align-items:center;flex-shrink:0}}
+.ocr-badge{{border-radius:6px;padding:2px 8px;font-size:11px;font-weight:bold;white-space:nowrap}}
+.ocr-ok{{background:#dcfce7;color:#16a34a;border:1px solid #86efac}}
+.ocr-warn{{background:#fef3c7;color:#d97706;border:1px solid #fcd34d}}
+.ocr-bad{{background:#fee2e2;color:#dc2626;border:1px solid #fca5a5}}
+.amend-row,.law-row{{font-size:12px;color:#475569;margin-bottom:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}}
+.amend-chip{{background:#fef3c7;color:#92400e;border:1px solid #fde68a;border-radius:4px;padding:1px 8px;font-size:11px}}
+.law-chip{{background:#ede9fe;color:#6d28d9;border:1px solid #c4b5fd;border-radius:4px;padding:1px 8px;font-size:11px}}
 
 /* ─── フッター ─── */
 .footer{{text-align:center;color:#94a3b8;font-size:11px;padding:24px;margin-top:8px}}
@@ -1779,13 +2003,22 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         issuer_guess = guess_issuer(text)
         fac, work, ev = tag_text(main or text)
 
+        # OCR品質スコアを計算（OCR系メソッドのみ）
+        ocr_q = 1.0
+        if "ocr" in method:
+            ocr_q = _compute_ocr_quality(text)
+
+        # 関連法令・改廃情報の抽出
+        related_laws = _extract_related_laws(main or text)
+        amendments = _extract_amendments(main or text)
+        date_sort = _date_to_sort_key(date_guess)
+
         # ファイルサイズを取得（needs_review判定で使用）
         file_size = os.path.getsize(get_safe_path(path))
         text_len = len(main or text)
 
         needs_rev = False
         if method in ("unhandled", "error") or "missing" in method:
-            # 抽出方法が見つからない・失敗した場合
             needs_rev = True
             if not reason:
                 if "xdw2text_missing" in method:
@@ -1799,10 +2032,8 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
                 else:
                     reason = f"抽出失敗: {method}"
         elif ext in (".xlsx", ".xlsm", ".xls", ".csv", ".txt"):
-            # スプレッドシート・テキストは抽出成功なら文字数不問で正常とみなす
             pass
         elif text_len < 30:
-            # 30文字未満は確実に抽出失敗または完全な画像PDF
             needs_rev = True
             if ext == ".pdf" and not TESSERACT_AVAILABLE:
                 reason = "画像PDFの可能性（Tesseract OCRが未インストールのため読取不可）"
@@ -1811,15 +2042,20 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
             else:
                 reason = f"本文がほぼ空です（{text_len}文字）"
         elif file_size > 30000 and text_len < 100:
-            # 30KB超のファイルなのに100文字未満 → 画像PDF等の可能性が高い
             needs_rev = True
             reason = f"ファイルサイズ({file_size // 1024}KB)に対して本文が短すぎます（{text_len}文字・画像PDF等の可能性）"
 
-        summary = make_summary(main or text, int(cfg.get("summary_chars", 900)), title_hint=title)
+        # OCR品質が低い場合も要確認
+        if ocr_q < 0.35 and not needs_rev:
+            needs_rev = True
+            reason = f"OCR品質が低い（スコア: {ocr_q}）。元ファイルの目視確認を推奨"
+
+        summary = make_summary(main or text, int(cfg.get("summary_chars", 900)),
+                               title_hint=title, ocr_quality=ocr_q)
         payload = f"タイトル(推定): {title}\n日付(推定): {date_guess}\n発出者(推定): {issuer_guess}\n\n# 本文\n{main.strip()}"
         if attach.strip(): payload += f"\n\n# 添付資料\n{attach.strip()}"
 
-        log_lines.append(f"[{method}] {rel}")
+        log_lines.append(f"[{method}] {rel}" + (f"  OCR品質:{ocr_q}" if ocr_q < 1.0 else ""))
         if reason:
             log_lines.append(f"  → {reason}")
 
@@ -1832,7 +2068,12 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
             title_guess=title, date_guess=date_guess, issuer_guess=issuer_guess,
             summary=summary, tags_facility=fac, tags_work=work, tag_evidence=ev,
             out_txt="", full_text_for_bind=payload,
+            ocr_quality=ocr_q, related_laws=related_laws, amendments=amendments,
+            date_sort_key=date_sort,
         ))
+
+    # ── 時系列ソート（日付の新しい順） ──
+    records.sort(key=lambda r: r.date_sort_key, reverse=True)
 
     write_excel_index(outdir, records)
     write_md_indices(outdir, records)
