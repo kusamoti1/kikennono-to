@@ -63,13 +63,87 @@ try:
 except Exception:
     xlrd = None
 
+def _setup_xdw_dll_path():
+    """XDWAPI.dllのディレクトリをPythonのDLL検索パスに追加する。
+
+    DocuWorks / DocuWorks Viewer Light がインストールされていても、
+    XDWAPI.dllがPATHに含まれていないとxdwlibがインポートできない。
+    レジストリとglobでインストールパスを自動検索し、
+    os.add_dll_directory()（Python 3.8+）とPATHの両方に追加する。
+    """
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import winreg
+        import glob as _glob
+
+        dll_dirs: List[str] = []
+
+        reg_keys = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fuji Xerox\DocuWorks"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\FUJIFILM\DocuWorks"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fujitsu\DocuWorks"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fujitsu\DocuWorks"),
+            (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Fuji Xerox\DocuWorks"),
+            (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\FUJIFILM\DocuWorks"),
+        ]
+        for hive, key_path in reg_keys:
+            try:
+                key = winreg.OpenKey(hive, key_path)
+                for vname in ("InstallPath", "Path", "Install_Dir", ""):
+                    try:
+                        val, _ = winreg.QueryValueEx(key, vname)
+                        d = str(val).strip()
+                        if os.path.isfile(os.path.join(d, "XDWAPI.dll")) and d not in dll_dirs:
+                            dll_dirs.append(d)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        for pattern in [
+            r"C:\Program Files\Fuji Xerox\DocuWorks\XDWAPI.dll",
+            r"C:\Program Files\FUJIFILM\DocuWorks\XDWAPI.dll",
+            r"C:\Program Files (x86)\Fuji Xerox\DocuWorks\XDWAPI.dll",
+            r"C:\Program Files (x86)\FUJIFILM\DocuWorks\XDWAPI.dll",
+            r"C:\Program Files\*\DocuWorks\XDWAPI.dll",
+            r"C:\Program Files (x86)\*\DocuWorks\XDWAPI.dll",
+            r"C:\Program Files\Fuji Xerox\*\XDWAPI.dll",
+            r"C:\Program Files\FUJIFILM\*\XDWAPI.dll",
+            r"C:\Windows\System32\XDWAPI.dll",
+            r"C:\Windows\SysWOW64\XDWAPI.dll",
+        ]:
+            if "*" in pattern:
+                for found in _glob.glob(pattern):
+                    d = os.path.dirname(found)
+                    if d not in dll_dirs:
+                        dll_dirs.append(d)
+            elif os.path.isfile(pattern):
+                d = os.path.dirname(pattern)
+                if d not in dll_dirs:
+                    dll_dirs.append(d)
+
+        for d in dll_dirs:
+            if hasattr(os, "add_dll_directory"):
+                try:
+                    os.add_dll_directory(d)
+                except Exception:
+                    pass
+            cur_path = os.environ.get("PATH", "")
+            if d.lower() not in cur_path.lower():
+                os.environ["PATH"] = d + os.pathsep + cur_path
+    except Exception:
+        pass
+
+_setup_xdw_dll_path()
+
 try:
     import xdwlib
     XDWLIB_AVAILABLE = True
 except Exception:
     XDWLIB_AVAILABLE = False
-
-# Windowsでサブプロセス実行時にコンソールウィンドウを表示しない設定
 _WIN_NO_CONSOLE: dict = (
     {"creationflags": 0x08000000} if sys.platform.startswith("win") else {}
 )
@@ -422,7 +496,9 @@ def extract_xdw(path: str) -> Tuple[str, str]:
             except Exception:
                 break
 
-    return "", "xdw2text_missing (要xdw2text.exe または xdoc2txt.exe 導入: DocuWorksフォルダ内 または https://ebstudio.info/home/xdoc2txt.html)"
+    # DocuWorks Viewer Lightがインストール済みの場合でも、
+    # テキスト抽出には別途 xdoc2txt.exe が必要（iFilter経由でXDWを読める）
+    return "", "xdw_text_extractor_missing"
 
 def split_main_attach(text: str, kws: List[str]) -> Tuple[str, str]:
     lines = text.splitlines()
@@ -1599,22 +1675,36 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
         flush()
 
 
-def copy_source_files(indir: str, outdir: str, records: List[Record]) -> List[str]:
+def copy_source_files(
+    indir: str,
+    outdir: str,
+    records: List[Record],
+    max_slots: int = 50,
+) -> Tuple[List[str], List[Tuple[str, str]]]:
     """原本PDFファイルをNotebookLM直接投入用フォルダにコピーする。
 
-    - コピー先: outdir/原本コピー/ （前回分を削除して再生成）
-    - 対象: PDFのみ（NotebookLMがネイティブに読めるファイル形式）
-    - ファイル名: 相対パスのパス区切りをアンダースコアに変換してフラット化
-    - 戻り値: コピーしたファイルのパスリスト（records のソート順＝法令→通知→マニュアル）
+    NotebookLMの制限に合わせてコピーを制限する:
+      - 1ファイルあたり 50MB 以下のみコピー
+      - 合計 250MB を超えた時点で停止
+      - max_slots 件を超えた時点で停止（50件制限からバンドル数等を引いた残り）
+
+    戻り値:
+      copied:  コピー済みファイルのパスリスト
+      skipped: スキップしたファイルのリスト [(relpath, 理由), ...]
     """
+    MAX_FILE_BYTES  = 50  * 1024 * 1024   # 50MB / ファイル
+    MAX_TOTAL_BYTES = 250 * 1024 * 1024   # 250MB 合計
+
     copy_dir = os.path.join(outdir, "原本コピー")
     if os.path.isdir(copy_dir):
         shutil.rmtree(copy_dir, ignore_errors=True)
     os.makedirs(copy_dir, exist_ok=True)
 
     COPYABLE_EXTS = {".pdf"}
-    copied: List[str] = []
+    copied:  List[str]               = []
+    skipped: List[Tuple[str, str]]   = []
     used_names: set = set()
+    total_bytes = 0
 
     for r in records:
         if r.ext.lower() not in COPYABLE_EXTS:
@@ -1622,6 +1712,24 @@ def copy_source_files(indir: str, outdir: str, records: List[Record]) -> List[st
         src = os.path.join(indir, r.relpath)
         if not os.path.isfile(get_safe_path(src)):
             continue
+
+        file_size = os.path.getsize(get_safe_path(src))
+
+        # 1ファイルの上限チェック（50MB）
+        if file_size > MAX_FILE_BYTES:
+            skipped.append((r.relpath, f"ファイルサイズ超過 ({file_size // (1024*1024)}MB > 50MB)"))
+            continue
+
+        # 合計サイズ上限チェック（250MB）
+        if total_bytes + file_size > MAX_TOTAL_BYTES:
+            skipped.append((r.relpath, f"合計250MB上限のためスキップ"))
+            continue
+
+        # 50件スロット上限チェック
+        if len(copied) >= max_slots:
+            skipped.append((r.relpath, "50件制限のためスキップ"))
+            continue
+
         # フラットなファイル名を生成（パス区切りをアンダースコアに変換）
         safe_name = r.relpath.replace(os.sep, "_").replace("/", "_")
         base, ext = os.path.splitext(safe_name)
@@ -1635,9 +1743,11 @@ def copy_source_files(indir: str, outdir: str, records: List[Record]) -> List[st
         try:
             shutil.copy2(get_safe_path(src), dst)
             copied.append(dst)
+            total_bytes += file_size
         except Exception:
             pass
-    return copied
+
+    return copied, skipped
 
 
 def write_notebook_preamble(
@@ -1719,18 +1829,20 @@ def write_notebook_preamble(
     return fpath
 
 
-def write_upload_guide(outdir: str, bundle_files: List[str], copied_files: List[str]):
+def write_upload_guide(
+    outdir: str,
+    bundle_files: List[str],
+    copied_files: List[str],
+    skipped_files: Optional[List[Tuple[str, str]]] = None,
+):
     """NotebookLMへの投入順序ガイドを生成する（00_投入ガイド.txt）。
 
-    50件制限を考慮し、説明文書→テキストバンドル→原本PDFの順で投入するよう案内する。
-    上限を超える場合は投入不可分を明示する。
+    50件制限・50MB/件・250MB合計を考慮した投入手順と除外ファイル一覧を出力する。
     """
     MAX_SOURCES = 50
     preamble_count = 1
     total = preamble_count + len(bundle_files) + len(copied_files)
-    pdf_slots = max(MAX_SOURCES - preamble_count - len(bundle_files), 0)
-    can_upload = min(len(copied_files), pdf_slots)
-    skipped = len(copied_files) - can_upload
+    skipped_files = skipped_files or []
 
     lines: List[str] = [
         "=" * 60,
@@ -1740,16 +1852,19 @@ def write_upload_guide(outdir: str, bundle_files: List[str], copied_files: List[
         f"投入するファイル総数: {total}件",
         f"  ・説明文書（はじめに）:  1件",
         f"  ・テキストバンドル:  {len(bundle_files):3d}件",
-        f"  ・原本PDF:           {len(copied_files):3d}件",
+        f"  ・原本PDF（コピー済み）:{len(copied_files):3d}件",
         f"NotebookLM上限:    {MAX_SOURCES}件",
     ]
     if total > MAX_SOURCES:
         lines += [
             "",
-            f"★★ 注意: 上限({MAX_SOURCES}件)を超えています ★★",
-            f"   原本PDFのうち {skipped}件は投入できません。",
-            "   下記「Step 3」で ✕ のついたファイルが投入不可分です。",
-            "   重要度の高いファイルから優先して投入してください。",
+            f"★ 注意: 上限({MAX_SOURCES}件)を超えています",
+            "  重要度の高いファイルを優先してください。",
+        ]
+    if skipped_files:
+        lines += [
+            "",
+            f"除外されたPDF: {len(skipped_files)}件（原本コピーフォルダには含まれていません）",
         ]
     lines += [
         "",
@@ -1767,17 +1882,23 @@ def write_upload_guide(outdir: str, bundle_files: List[str], copied_files: List[
         lines.append(f"  → {os.path.basename(f)}")
     lines += [
         "",
-        f"▼ Step 3: 原本PDFを投入（原本コピーフォルダ内）",
-        f"  ※ 上限まで残り {pdf_slots}件分のスロットがあります。",
+        "▼ Step 3: 原本PDFを投入（原本コピーフォルダ内・全て投入）",
     ]
-    for i, f in enumerate(copied_files):
-        marker = "  → " if i < can_upload else "  ✕ "
-        lines.append(f"{marker}{os.path.basename(f)}")
-    if skipped > 0:
+    for f in copied_files:
+        lines.append(f"  → {os.path.basename(f)}")
+    if skipped_files:
         lines += [
             "",
-            f"上記 ✕ の {skipped}件は50件制限のため投入できません。",
-            "重要度の低い文書を除外するか、複数ノートブックに分割してください。",
+            "─" * 40,
+            "【制限により除外されたPDF（NotebookLMには入れていません）】",
+            "  ※ 50MB超・合計250MB超・50件上限のいずれかに該当",
+            "─" * 40,
+        ]
+        for relpath, reason in skipped_files:
+            lines.append(f"  除外: {os.path.basename(relpath)}  （{reason}）")
+        lines += [
+            "",
+            "除外されたファイルが重要な場合は、別ノートブックに分けて投入してください。",
         ]
     lines.append("")
 
@@ -2614,8 +2735,11 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
         if method in ("unhandled", "error") or "missing" in method:
             needs_rev = True
             if not reason:
-                if "xdw2text_missing" in method:
-                    reason = "DocuWorksがインストールされていないため読取不可（xdw2text.exe または xdoc2txt.exe が必要: https://ebstudio.info/home/xdoc2txt.html）"
+                if "xdw_text_extractor_missing" in method:
+                    if XDWLIB_AVAILABLE:
+                        reason = "DocuWorks Viewer Light は検出済みですが、このファイルのテキスト抽出に失敗しました（文書が保護されている可能性）"
+                    else:
+                        reason = "DocuWorks テキスト抽出ツールが見つかりません。DocuWorks Viewer Light がインストール済みの場合は xdoc2txt.exe を追加してください: https://ebstudio.info/home/xdoc2txt.html"
                 elif method == "unhandled":
                     reason = f"未対応ファイル形式 ({ext})"
                 elif "pymupdf_missing" in method:
@@ -2688,9 +2812,11 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
     # 原本PDFをコピーし、説明文書・投入ガイドを生成する
     import glob as _glob
     bundle_files = sorted(_glob.glob(os.path.join(outdir, "NotebookLM用_*.txt")))
-    copied_files = copy_source_files(indir, outdir, records)
+    # 50件制限から説明文書(1件)・バンドル分を引いた残りスロットを渡す
+    _pdf_slots = max(50 - 1 - len(bundle_files), 0)
+    copied_files, skipped_files = copy_source_files(indir, outdir, records, max_slots=_pdf_slots)
     write_notebook_preamble(outdir, records, bundle_files, copied_files)
-    write_upload_guide(outdir, bundle_files, copied_files)
+    write_upload_guide(outdir, bundle_files, copied_files, skipped_files)
 
     # サマリーを集計してログファイルに保存
     needs_rev_count = len([r for r in records if r.needs_review])
