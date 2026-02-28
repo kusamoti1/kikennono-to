@@ -981,13 +981,22 @@ def _is_garbage_line(s: str) -> bool:
         return True
     if _GARBAGE_LINE_RE.match(s):
         return True
-    # OCRゴミ検出: スペースを除いた文字が6文字以上あるのに日本語文字が一切ない
-    # 例: "NMWMMMMMUMNMNI"（全て英大文字）、"===[]==="（記号のみ）等
+    # OCRゴミ検出: スペースを除いた文字で判定
     no_space = s.replace(' ', '').replace('　', '').replace('\t', '')
-    if len(no_space) >= 6:
+    if len(no_space) >= 4:
         jp_count = len(re.findall(r'[ぁ-んァ-ン一-龥]', no_space))
-        if jp_count == 0:
-            # 数字・記号・ASCII のみ → OCRゴミとして除去
+        total = len(no_space)
+        # (1) 日本語文字が一切ない → OCRゴミ
+        if jp_count == 0 and total >= 6:
+            return True
+        # (2) 日本語比率が極端に低い（10%未満で10文字以上）→ OCR化け
+        #     例: "MNWMれMMNI" のようなケース
+        if total >= 10 and jp_count > 0 and (jp_count / total) < 0.10:
+            return True
+        # (3) 連続するASCII大文字が多い → OCR化けの典型
+        #     例: "NMWMMMMMUMNMNI" の中にカタカナ1文字混入
+        ascii_upper_runs = re.findall(r'[A-Z]{4,}', no_space)
+        if ascii_upper_runs and sum(len(r) for r in ascii_upper_runs) > total * 0.5:
             return True
     return False
 
@@ -1581,22 +1590,13 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
                 continue
             doc_num += 1
 
-            # 法令参照メタデータ（通知の場合、参照する法令条文を明記）
-            ref_meta = ""
-            if doc_type == "通知" and r.related_laws:
-                ref_meta = f"関連法令: {', '.join(r.related_laws)}\n"
-            if doc_type == "通知" and r.amendments:
-                ref_meta = ref_meta + f"改廃関係: {', '.join(r.amendments)}\n"
-
-            toc_entry = f"  {doc_num:3d}. [{doc_type}] {r.title_guess}（{r.date_guess or '日付不明'}）"
+            # ★ NotebookLM用テキストにはAI推定情報を入れない
+            # 元ファイルパスのみを付記（出典の追跡用）
+            toc_entry = f"  {doc_num:3d}. {r.title_guess}（{r.date_guess or '日付不明'}）"
             block = (
                 f"\n\n{'='*60}\n"
-                f"【{doc_type} No.{doc_num}】\n"
-                f"文書タイプ: {doc_type}\n"
+                f"【文書 No.{doc_num}】\n"
                 f"元ファイル: {r.relpath}\n"
-                f"タイトル: {r.title_guess}\n"
-                f"日付: {r.date_guess or '不明'} / 発出: {r.issuer_guess or '不明'}\n"
-                f"{ref_meta}"
                 f"{'-'*60}\n"
                 f"{r.full_text_for_bind}\n"
                 f"{'='*60}\n\n"
@@ -1611,9 +1611,9 @@ def write_binded_texts(outdir: str, records: List[Record], limit_bytes: int):
 
 
 def write_cross_reference_map(outdir: str, records: List[Record]):
-    """相互参照マップを生成する。
+    """相互参照マップを生成する（人間確認用・NotebookLMには入れない）。
     通知が参照する法令条文と、法令文書を紐付ける。
-    NotebookLMにこのファイルも入れることで横断検索の精度が上がる。"""
+    ★ これは機械推定なので必ず人間が確認すること。"""
 
     law_records = [r for r in records if r.doc_type == "法令"]
     notice_records = [r for r in records if r.doc_type == "通知"]
@@ -1623,6 +1623,16 @@ def write_cross_reference_map(outdir: str, records: List[Record]):
     lines.append("=" * 60)
     lines.append("【相互参照マップ】法令・通知・マニュアルの関連付け")
     lines.append("=" * 60)
+    lines.append("")
+    lines.append("★★★ 注意 ★★★")
+    lines.append("このファイルの内容は機械（テキストパターン）による推定です。")
+    lines.append("間違いが含まれている可能性があります。")
+    lines.append("必ず人間が確認してから利用してください。")
+    lines.append("")
+    lines.append("【NotebookLMへの入力について】")
+    lines.append("このファイルの内容を確認し、間違いがなければNotebookLMに入れて")
+    lines.append("ください。間違いがあればその部分を修正するか、このファイルは")
+    lines.append("NotebookLMに入れずに参考資料としてのみ利用してください。")
     lines.append("")
     lines.append(f"法令: {len(law_records)}件 / 通知: {len(notice_records)}件 / マニュアル: {len(manual_records)}件")
     lines.append("")
@@ -2158,9 +2168,10 @@ body{{font-family:'Meiryo UI','Yu Gothic UI','Hiragino Sans',sans-serif;backgrou
     </div>
     <div class="guide-box">
       💡 <span><strong>NotebookLMへの入力：</strong>
-      出力フォルダの「00_統合目次.md」「00_相互参照マップ.txt」と
-      「NotebookLM用_○○_○○.txt」を全てNotebookLMにアップロードしてください。
-      相互参照マップを入れることで法令↔通知の横断検索精度が向上します。</span>
+      「NotebookLM用_○○.txt」を全てアップロードしてください（これが本文です）。
+      「00_相互参照マップ.txt」は<strong>機械推定</strong>なので、
+      中身を確認して間違いがなければ入れてください。間違いがあれば入れないでください。
+      NotebookLMはソースの内容をそのまま引用するため、間違った情報を入れると誤った回答の原因になります。</span>
     </div>
   </section>
 
@@ -2471,22 +2482,12 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
             summary = make_summary(main or text, summary_chars,
                                    title_hint=title, ocr_quality=ocr_q)
 
-        # ── タイプ別ペイロード（NotebookLM用テキスト）──
-        type_label = f"【文書タイプ: {doc_type}】\n"
-        ref_label = ""
-        if related_laws:
-            ref_label += f"【関連法令】{', '.join(related_laws)}\n"
-        if amendments:
-            ref_label += f"【改廃関係】{', '.join(amendments)}\n"
-
-        payload = (
-            f"{type_label}"
-            f"タイトル(推定): {title}\n"
-            f"日付(推定): {date_guess}\n"
-            f"発出者(推定): {issuer_guess}\n"
-            f"{ref_label}"
-            f"\n# 本文\n{main.strip()}"
-        )
+        # ── ペイロード（NotebookLM用テキスト）──
+        # ★重要: NotebookLMに渡すテキストにはAI推定情報を入れない
+        # NotebookLMは入力ソースだけを参照するため、推定が間違っていると
+        # NotebookLMが誤情報を「事実」として引用してしまう。
+        # タイトル・日付・発出者は本文中に元々含まれているのでそのまま渡す。
+        payload = f"# 本文\n{main.strip()}"
         if attach.strip():
             payload += f"\n\n# 添付資料\n{attach.strip()}"
 
