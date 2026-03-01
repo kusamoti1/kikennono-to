@@ -140,6 +140,10 @@ def main() -> None:
         help="CSVの相対パスを解決する基準フォルダ（省略可）。",
     )
     parser.add_argument(
+        "--source-base",
+        help="CSVの相対パスを解決する基準フォルダ（省略可）。",
+    )
+    parser.add_argument(
         "--import-all-dir",
         help="指定フォルダ内の対応ファイルを全上書きで取り込みます（初心者向け）。",
     )

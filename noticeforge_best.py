@@ -64,13 +64,7 @@ except Exception:
     xlrd = None
 
 def _setup_xdw_dll_path():
-    """XDWAPI.dllのディレクトリをPythonのDLL検索パスに追加する。
-
-    DocuWorks / DocuWorks Viewer Light がインストールされていても、
-    XDWAPI.dllがPATHに含まれていないとxdwlibがインポートできない。
-    レジストリとglobでインストールパスを自動検索し、
-    os.add_dll_directory()（Python 3.8+）とPATHの両方に追加する。
-    """
+    """XDWAPI.dllのディレクトリをPythonのDLL検索パスに追加する。"""
     if not sys.platform.startswith("win"):
         return
     try:
@@ -79,12 +73,24 @@ def _setup_xdw_dll_path():
 
         dll_dirs: List[str] = []
 
+        def _add_if_has_dll(base: str):
+            if not base:
+                return
+            for rel in (
+                "", "bin", "Program", os.path.join("Program", "bin"),
+                "DocuWorks", os.path.join("DocuWorks", "bin"),
+                r"DocuWorks Viewer Light", os.path.join(r"DocuWorks Viewer Light", "bin"),
+                r"DocuWorks Viewer Light 10", os.path.join(r"DocuWorks Viewer Light 10", "bin"),
+            ):
+                d = os.path.join(base, rel) if rel else base
+                if os.path.isfile(os.path.join(d, "XDWAPI.dll")) and d not in dll_dirs:
+                    dll_dirs.append(d)
+
         reg_keys = [
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fuji Xerox\DocuWorks"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\FUJIFILM\DocuWorks"),
-            # DocuWorks Viewer Light 専用キー（Viewer Lightはフルとは別キーに登録されることがある）
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks Viewer Light"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\FUJIFILM\DocuWorks Viewer Light"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks Viewer Light 10"),
@@ -93,10 +99,6 @@ def _setup_xdw_dll_path():
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks Viewer Light"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fuji Xerox\DocuWorks Viewer Light 10"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks Viewer Light 10"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fujitsu\DocuWorks"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fujitsu\DocuWorks"),
-            (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Fuji Xerox\DocuWorks"),
-            (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\FUJIFILM\DocuWorks"),
             (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\FUJIFILM\DocuWorks Viewer Light"),
             (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\FUJIFILM\DocuWorks Viewer Light 10"),
             (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Fuji Xerox\DocuWorks Viewer Light 10"),
@@ -107,41 +109,58 @@ def _setup_xdw_dll_path():
                 for vname in ("InstallPath", "Path", "Install_Dir", ""):
                     try:
                         val, _ = winreg.QueryValueEx(key, vname)
-                        d = str(val).strip()
-                        for rel in ("", "bin", "Program", "DocuWorks", r"DocuWorks Viewer Light", r"DocuWorks Viewer Light 10"):
-                            base = os.path.join(d, rel) if rel else d
-                            if os.path.isfile(os.path.join(base, "XDWAPI.dll")) and base not in dll_dirs:
-                                dll_dirs.append(base)
+                        _add_if_has_dll(str(val).strip())
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        # Uninstallキーからの補助検出
+        uninstall_roots = [
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        ]
+        for hive, root in uninstall_roots:
+            try:
+                uroot = winreg.OpenKey(hive, root)
+                sub_count, _, _ = winreg.QueryInfoKey(uroot)
+                for i in range(sub_count):
+                    try:
+                        sub_name = winreg.EnumKey(uroot, i)
+                        skey = winreg.OpenKey(uroot, sub_name)
+                        disp, _ = winreg.QueryValueEx(skey, "DisplayName")
+                        disp_s = str(disp)
+                        if "DocuWorks" not in disp_s or "Viewer Light" not in disp_s:
+                            continue
+                        for vn in ("InstallLocation", "InstallPath", "Path"):
+                            try:
+                                loc, _ = winreg.QueryValueEx(skey, vn)
+                                _add_if_has_dll(str(loc).strip())
+                            except Exception:
+                                continue
                     except Exception:
                         continue
             except Exception:
                 continue
 
         for pattern in [
-            # DocuWorks フル版
             r"C:\Program Files\Fuji Xerox\DocuWorks\XDWAPI.dll",
             r"C:\Program Files\FUJIFILM\DocuWorks\XDWAPI.dll",
             r"C:\Program Files (x86)\Fuji Xerox\DocuWorks\XDWAPI.dll",
             r"C:\Program Files (x86)\FUJIFILM\DocuWorks\XDWAPI.dll",
-            # DocuWorks Viewer Light 専用パス（バージョン10等）
-            r"C:\Program Files\Fuji Xerox\DocuWorks Viewer Light\XDWAPI.dll",
-            r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light\XDWAPI.dll",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light 10\XDWAPI.dll",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light 10\bin\XDWAPI.dll",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light 10\Program\XDWAPI.dll",
-            r"C:\Program Files (x86)\Fuji Xerox\DocuWorks Viewer Light\XDWAPI.dll",
-            r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light\XDWAPI.dll",
+            r"C:\Program Files\FUJIFILM\Business Innovation\DocuWorks Viewer Light 10\XDWAPI.dll",
+            r"C:\Program Files\FUJIFILM\Business Innovation\DocuWorks Viewer Light 10\bin\XDWAPI.dll",
             r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light 10\XDWAPI.dll",
-            # ワイルドカードでバージョン番号付きフォルダも拾う
             r"C:\Program Files\*\DocuWorks\XDWAPI.dll",
             r"C:\Program Files (x86)\*\DocuWorks\XDWAPI.dll",
-            r"C:\Program Files\FUJIFILM\*\XDWAPI.dll",
-            r"C:\Program Files\Fuji Xerox\*\XDWAPI.dll",
-            r"C:\Program Files (x86)\FUJIFILM\*\XDWAPI.dll",
-            r"C:\Program Files (x86)\Fuji Xerox\*\XDWAPI.dll",
             r"C:\Program Files\*\*\XDWAPI.dll",
             r"C:\Program Files (x86)\*\*\XDWAPI.dll",
-            # システム全域
+            r"C:\Program Files\*\*\*\XDWAPI.dll",
+            r"C:\Program Files (x86)\*\*\*\XDWAPI.dll",
             r"C:\Windows\System32\XDWAPI.dll",
             r"C:\Windows\SysWOW64\XDWAPI.dll",
         ]:
@@ -179,13 +198,10 @@ _WIN_NO_CONSOLE: dict = (
 )
 
 def _build_xdw2text_candidates() -> List[str]:
-    """xdw2text.exeの候補パスを構築する。
-    レジストリ自動検出 → Program Files全体スキャン → 固定パスの順で探す。
-    TokiwaWorks / DocuWorks Viewer / 任意のバージョンを自動検出できる。"""
-    candidates: List[str] = ["xdw2text"]  # まずPATH上を探す
+    """xdw2text.exeの候補パスを構築する。"""
+    candidates: List[str] = ["xdw2text"]
 
     if sys.platform.startswith("win"):
-        # ── 方法①: Windowsレジストリを検索してインストールパスを自動検出 ──
         try:
             import winreg
             reg_keys = [
@@ -193,7 +209,6 @@ def _build_xdw2text_candidates() -> List[str]:
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\FUJIFILM\DocuWorks"),
-                # DocuWorks Viewer Light 専用キー
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks Viewer Light"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\FUJIFILM\DocuWorks Viewer Light"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\FUJIFILM\DocuWorks Viewer Light 10"),
@@ -202,13 +217,7 @@ def _build_xdw2text_candidates() -> List[str]:
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks Viewer Light"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fuji Xerox\DocuWorks Viewer Light 10"),
                 (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fuji Xerox\DocuWorks Viewer Light 10"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Fujitsu\DocuWorks"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Fujitsu\DocuWorks"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\TokiwaWorks\TokiwaWorks"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\TokiwaWorks\TokiwaWorks"),
-                (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Fuji Xerox\DocuWorks"),
-                (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\FUJIFILM\DocuWorks"),
-                (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\TokiwaWorks\TokiwaWorks"),
+                (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\FUJIFILM\DocuWorks Viewer Light 10"),
             ]
             for hive, key_path in reg_keys:
                 try:
@@ -221,13 +230,17 @@ def _build_xdw2text_candidates() -> List[str]:
                                 "xdw2text.exe",
                                 os.path.join("bin", "xdw2text.exe"),
                                 os.path.join("Program", "xdw2text.exe"),
+                                os.path.join("Program", "bin", "xdw2text.exe"),
                                 os.path.join("DocuWorks", "xdw2text.exe"),
+                                os.path.join("DocuWorks", "bin", "xdw2text.exe"),
                                 os.path.join("DocuWorks Viewer Light", "xdw2text.exe"),
                                 os.path.join("DocuWorks Viewer Light", "bin", "xdw2text.exe"),
                                 os.path.join("DocuWorks Viewer Light", "Program", "xdw2text.exe"),
                                 os.path.join("DocuWorks Viewer Light 10", "xdw2text.exe"),
                                 os.path.join("DocuWorks Viewer Light 10", "bin", "xdw2text.exe"),
                                 os.path.join("DocuWorks Viewer Light 10", "Program", "xdw2text.exe"),
+                                os.path.join("Business Innovation", "DocuWorks Viewer Light 10", "xdw2text.exe"),
+                                os.path.join("Business Innovation", "DocuWorks Viewer Light 10", "bin", "xdw2text.exe"),
                             ]
                             for rel in rel_candidates:
                                 exe = os.path.join(base, rel)
@@ -240,8 +253,6 @@ def _build_xdw2text_candidates() -> List[str]:
         except Exception:
             pass
 
-        # ── 方法②: C:\Program Files 以下を glob で自動スキャン ──
-        # TokiwaWorks / DocuWorks Viewer など任意のインストール先を検出できる
         try:
             import glob as _glob
             for pattern in [
@@ -258,27 +269,17 @@ def _build_xdw2text_candidates() -> List[str]:
         except Exception:
             pass
 
-        # ── 方法③: 固定パス（フォールバック） ──
         candidates += [
-            r"C:\Program Files\Fuji Xerox\DocuWorks\xdw2text.exe",
-            r"C:\Program Files (x86)\Fuji Xerox\DocuWorks\xdw2text.exe",
-            r"C:\Program Files\FUJIFILM\DocuWorks\xdw2text.exe",
-            r"C:\Program Files (x86)\FUJIFILM\DocuWorks\xdw2text.exe",
-            # DocuWorks Viewer Light 10 専用パス
-            r"C:\Program Files\Fuji Xerox\DocuWorks Viewer Light\xdw2text.exe",
-            r"C:\Program Files (x86)\Fuji Xerox\DocuWorks Viewer Light\xdw2text.exe",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light\xdw2text.exe",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light\bin\xdw2text.exe",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light\Program\xdw2text.exe",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light 10\xdw2text.exe",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light 10\bin\xdw2text.exe",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light 10\Program\xdw2text.exe",
-            r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light\xdw2text.exe",
+            r"C:\Program Files\FUJIFILM\Business Innovation\DocuWorks Viewer Light 10\xdw2text.exe",
+            r"C:\Program Files\FUJIFILM\Business Innovation\DocuWorks Viewer Light 10\bin\xdw2text.exe",
             r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light 10\xdw2text.exe",
-            r"C:\Program Files\TokiwaWorks\xdw2text.exe",
-            r"C:\Program Files (x86)\TokiwaWorks\xdw2text.exe",
-            r"C:\Program Files\DocuWorks\xdw2text.exe",
-            r"C:\Program Files (x86)\DocuWorks\xdw2text.exe",
+            r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light 10\bin\xdw2text.exe",
         ]
     return candidates
 
@@ -564,7 +565,7 @@ def extract_xdw(path: str) -> Tuple[str, str]:
 
     # DocuWorks Viewer Lightがインストール済みの場合でも、
     # テキスト抽出には別途 xdoc2txt.exe が必要（iFilter経由でXDWを読める）
-    return "", "xdw_text_extractor_missing"
+    return "", f"xdw_text_extractor_missing:cand={len(XDW2TEXT_CANDIDATES)}"
 
 def split_main_attach(text: str, kws: List[str]) -> Tuple[str, str]:
     lines = text.splitlines()

@@ -36,4 +36,8 @@
 ## 6. DocuWorks（.xdw）が読めないとき
 - 無料の **DocuWorks Viewer Light 10** を使えます。
 - 本アプリは Viewer Light 10 のインストール場所（通常/`bin`/`Program`）を自動検出します。
-- それでも読めない場合は、Viewer Light 10 のインストール先に `xdw2text.exe` があるか確認してください。
+- それでも読めない場合は、次の順で確認してください。
+  1. Viewer Light 10 を再インストール（管理者権限）
+  2. インストール先に `XDWAPI.dll` があるか確認
+  3. インストール先（または `bin` / `Program`）に `xdw2text.exe` があるか確認
+  4. `xdw2text.exe` が無い場合は無料の `xdoc2txt.exe` を追加
