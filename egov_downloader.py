@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-egov_downloader.py - 外部APIを使わず、手動取り込み用の雛形を作るツール
+egov_downloader.py - 外部APIを使わず、手動取り込みを行うツール
 
 このスクリプトは、e-Gov など外部サイトへのアクセスを行いません。
 取り込む法令・通知・資料は、ユーザーが自分で決めて管理します。
 
 使い方（かんたん）:
-  1) 雛形を作る
+  A) 選択式（CSV）
      python egov_downloader.py
-
-  2) 作られた CSV に、取り込みたいファイルパスを記入
-
-  3) 記入した CSV を使って、選んだファイルだけを収集
      python egov_downloader.py --apply-csv 危険物法令/取り込み候補_記入用.csv
+
+  B) まるごと上書き（初心者向け）
+     python egov_downloader.py --import-all-dir "C:\資料フォルダ"
+
+     ※ 既存の「危険物法令/法令」内は全削除してから、
+        指定フォルダ内のファイルを再コピーします。
 """
 from __future__ import annotations
 
@@ -27,6 +29,11 @@ GUIDE_FILE = "00_手動取り込みガイド.txt"
 CSV_FILE = "取り込み候補_記入用.csv"
 DEST_DIR = "法令"
 
+# NoticeForgeで扱うことが多い形式を対象
+SUPPORTED_EXTS = {
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".csv", ".xdw", ".xbd"
+}
+
 
 def _write_guide(out_dir: Path) -> Path:
     guide = out_dir / GUIDE_FILE
@@ -35,16 +42,22 @@ def _write_guide(out_dir: Path) -> Path:
 このツールは外部ダウンロードをしません。
 取り込むものは、あなたが決めます。
 
-手順:
+手順A（CSVで選ぶ）:
 1. 「取り込み候補_記入用.csv」を開く
 2. 取り込みたいファイルのパスを入力する
 3. 取り込む列に 1 を入れる
 4. 次のコマンドを実行する
    python egov_downloader.py --apply-csv 取り込み候補_記入用.csv
 
+手順B（おすすめ：まるごと上書き）:
+1. 取り込みたい資料を1つのフォルダに集める
+2. 次のコマンドを実行する
+   python egov_downloader.py --import-all-dir "C:\資料フォルダ"
+
 実行後:
-- 選んだファイルだけが「法令」フォルダにコピーされます
-- その「法令」フォルダを NoticeForge の入力フォルダ内に置けば、
+- 「危険物法令/法令」フォルダが作られます
+- 手順Bでは、法令フォルダ内をいったん空にしてから再作成します
+- この法令フォルダを NoticeForge の入力フォルダに置くと、
   NotebookLM 用の指標（目次や要約）は、その内容を基準に作られます
 """
     guide.write_text(text, encoding="utf-8")
@@ -76,6 +89,20 @@ def _is_enabled(v: str) -> bool:
     return str(v).strip() in {"1", "true", "True", "TRUE", "yes", "YES", "y", "Y"}
 
 
+def _clear_directory(path: Path) -> None:
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            try:
+                child.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def apply_csv(csv_path: Path, out_dir: Path, source_base: Path | None = None) -> List[str]:
     if not csv_path.exists():
         raise FileNotFoundError(f"CSVが見つかりません: {csv_path}")
@@ -101,11 +128,11 @@ def apply_csv(csv_path: Path, out_dir: Path, source_base: Path | None = None) ->
                 skipped.append(f"{idx}: 見つからないためスキップ -> {src}")
                 continue
 
-            dst = dest_dir / f"{idx:02d}_{src.name}"
+            dst = dest_dir / f"{idx:03d}_{src.name}"
             shutil.copy2(src, dst)
             copied.append(str(dst))
 
-    print("\n=== 取り込み結果 ===")
+    print("\n=== 取り込み結果（CSV選択）===")
     print(f"コピー完了: {len(copied)}件")
     for p in copied:
         print(f"  + {p}")
@@ -115,6 +142,48 @@ def apply_csv(csv_path: Path, out_dir: Path, source_base: Path | None = None) ->
         for s in skipped:
             print(f"  - {s}")
 
+    return copied
+
+
+def import_all_overwrite(import_dir: Path, out_dir: Path) -> List[str]:
+    """指定フォルダ内の対応ファイルを、法令フォルダへ全上書きコピーする。"""
+    if not import_dir.exists() or not import_dir.is_dir():
+        raise FileNotFoundError(f"取り込み元フォルダが見つかりません: {import_dir}")
+
+    _, _, dest_dir = prepare_template(out_dir)
+    _clear_directory(dest_dir)
+
+    files = [
+        p for p in import_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
+    ]
+    # 「最新が最後」になるよう、更新日時が古い順で並べる
+    files.sort(key=lambda p: p.stat().st_mtime)
+
+    copied: List[str] = []
+    used_names: set[str] = set()
+
+    for idx, src in enumerate(files, start=1):
+        rel = src.relative_to(import_dir)
+        # フォルダ構造を潰して重複回避しやすい名前にする
+        base_name = str(rel).replace("/", "_").replace("\\", "_")
+        stem = f"{idx:03d}_{base_name}"
+        candidate = stem
+        c = 1
+        while candidate.lower() in used_names:
+            p = Path(stem)
+            candidate = f"{p.stem}_{c}{p.suffix}"
+            c += 1
+        used_names.add(candidate.lower())
+
+        dst = dest_dir / candidate
+        shutil.copy2(src, dst)
+        copied.append(str(dst))
+
+    print("\n=== 取り込み結果（まるごと上書き）===")
+    print(f"取り込み元: {import_dir}")
+    print(f"コピー完了: {len(copied)}件")
+    print("※ 既存の法令フォルダ内は上書き再作成しました")
     return copied
 
 
@@ -135,6 +204,10 @@ def main() -> None:
         "--source-base",
         help="CSVの相対パスを解決する基準フォルダ（省略可）。",
     )
+    parser.add_argument(
+        "--import-all-dir",
+        help="指定フォルダ内の対応ファイルを全上書きで取り込みます（初心者向け）。",
+    )
     parser.add_argument("--out", "-o", default="危険物法令", help="出力フォルダ（デフォルト: 危険物法令/）")
     parser.add_argument("--apply-csv", help="記入済みCSVを指定すると、取り込む=1のファイルだけを収集します。")
     parser.add_argument("--source-base", help="CSVの相対パスを解決する基準フォルダ（省略可）。")
@@ -150,6 +223,10 @@ def main() -> None:
     print(f"- ガイド: {guide.name}")
     print(f"- 記入用CSV: {csv_path.name}")
     print(f"- 収集先フォルダ: {dest.name}")
+
+    if args.import_all_dir:
+        import_all_overwrite(Path(args.import_all_dir), out_dir)
+        return
 
     if args.apply_csv:
         apply_csv(
