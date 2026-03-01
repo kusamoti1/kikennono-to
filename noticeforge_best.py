@@ -2213,6 +2213,32 @@ def extract_csv(path: str) -> Tuple[str, str]:
             continue
     return "", "csv_err"
 
+def extract_xml(path: str) -> Tuple[str, str]:
+    """XMLファイルを読み込み、タグを除去した可読テキストを返す。"""
+    raw = ""
+    for enc in ("utf-8-sig", "utf-8", "cp932", "latin-1"):
+        try:
+            with open(get_safe_path(path), "r", encoding=enc, errors="ignore") as f:
+                raw = f.read()
+            break
+        except Exception:
+            continue
+    if not raw:
+        return "", "xml_err"
+
+    # 最低限の可読化（タグ除去）
+    text = re.sub(r"<\?xml[^>]*\?>", "", raw, flags=re.IGNORECASE)
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = _html.unescape(text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text.replace("\r\n", "\n").replace("\r", "\n"))
+    text = text.strip()
+
+    if text:
+        return text, "xml_text"
+    return raw, "xml_raw"
+
 def write_html_report(outdir: str, records: List[Record]):
     """人間が見やすいHTMLレポートを生成する（ブラウザで開くだけでOK）"""
     def esc(s: object) -> str:
@@ -2229,7 +2255,7 @@ def write_html_report(outdir: str, records: List[Record]):
         ".pdf": "PDF", ".docx": "Word",
         ".xlsx": "Excel", ".xlsm": "Excel", ".xls": "Excel",
         ".xdw": "DocuWorks", ".xbd": "DocuWorks",
-        ".txt": "テキスト", ".csv": "CSV",
+        ".txt": "テキスト", ".csv": "CSV", ".xml": "XML",
     }
     ext_counts: Dict[str, int] = {}
     for r in records:
@@ -2877,6 +2903,8 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
                 text, method = extract_txt(path)
             elif ext == ".csv":
                 text, method = extract_csv(path)
+            elif ext == ".xml":
+                text, method = extract_xml(path)
         except Exception as e:
             method, reason = "error", f"抽出エラー: {e.__class__.__name__}"
 
@@ -2916,7 +2944,7 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
                     reason = "Excelライブラリが未インストール（pip install openpyxl xlrd）"
                 else:
                     reason = f"抽出失敗: {method}"
-        elif ext in (".xlsx", ".xlsm", ".xls", ".csv", ".txt"):
+        elif ext in (".xlsx", ".xlsm", ".xls", ".csv", ".txt", ".xml"):
             pass
         elif text_len < 30:
             needs_rev = True

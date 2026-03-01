@@ -135,6 +135,24 @@ def main() -> None:
         "--source-base",
         help="CSVの相対パスを解決する基準フォルダ（省略可）。",
     )
+    parser.add_argument(
+        "--source-base",
+        help="CSVの相対パスを解決する基準フォルダ（省略可）。",
+    )
+    parser.add_argument(
+        "--source-base",
+        help="CSVの相対パスを解決する基準フォルダ（省略可）。",
+    )
+    parser.add_argument(
+        "--import-all-dir",
+        help="指定フォルダ内の対応ファイルを全上書きで取り込みます（初心者向け）。",
+    )
+    parser.add_argument("--out", "-o", default="危険物法令", help="出力フォルダ（デフォルト: 危険物法令/）")
+    parser.add_argument("--apply-csv", help="記入済みCSVを指定すると、取り込む=1のファイルだけを収集します。")
+    parser.add_argument("--source-base", help="CSVの相対パスを解決する基準フォルダ（省略可）。")
+    parser.add_argument("--from-dir", help="このフォルダを走査してCSV候補を自動作成します。")
+    parser.add_argument("--no-recursive", action="store_true", help="--from-dir 時にサブフォルダを走査しません。")
+    parser.add_argument("--auto-collect", action="store_true", help="--from-dir 後に自動で収集まで実行します。")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
