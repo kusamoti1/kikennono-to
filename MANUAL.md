@@ -25,3 +25,5 @@
   - `python egov_downloader.py`
   - 作成された `取り込み候補_記入用.csv` にファイルパスを入れて、`取り込む(1/0)` を `1` にする
   - `python egov_downloader.py --apply-csv 危険物法令/取り込み候補_記入用.csv`
+
+- XML（`.xml`）もそのまま取り込めます。
