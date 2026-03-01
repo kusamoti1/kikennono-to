@@ -17,3 +17,11 @@
 ## 3. NotebookLMへ入れるもの
 - 00_統合目次.md
 - docs_txt（中のtxt全部）
+
+## 4. 法令データの取り込みについて（変更点）
+- 外部サイト（e-Gov API）からの自動取り込みは行いません。
+- 取り込む資料は、あなたが選んだファイルだけにします。
+- `egov_downloader.py` を実行すると、手動取り込み用のCSVとガイドが作られます。
+  - `python egov_downloader.py`
+  - 作成された `取り込み候補_記入用.csv` にファイルパスを入れて、`取り込む(1/0)` を `1` にする
+  - `python egov_downloader.py --apply-csv 危険物法令/取り込み候補_記入用.csv`
