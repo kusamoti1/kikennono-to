@@ -102,8 +102,10 @@ def _setup_xdw_dll_path():
                     try:
                         val, _ = winreg.QueryValueEx(key, vname)
                         d = str(val).strip()
-                        if os.path.isfile(os.path.join(d, "XDWAPI.dll")) and d not in dll_dirs:
-                            dll_dirs.append(d)
+                        for rel in ("", "bin", "Program", "DocuWorks", r"DocuWorks Viewer Light", r"DocuWorks Viewer Light 10"):
+                            base = os.path.join(d, rel) if rel else d
+                            if os.path.isfile(os.path.join(base, "XDWAPI.dll")) and base not in dll_dirs:
+                                dll_dirs.append(base)
                     except Exception:
                         continue
             except Exception:
@@ -118,8 +120,10 @@ def _setup_xdw_dll_path():
             # DocuWorks Viewer Light 専用パス（バージョン10等）
             r"C:\Program Files\Fuji Xerox\DocuWorks Viewer Light\XDWAPI.dll",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light\XDWAPI.dll",
+            r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light 10\XDWAPI.dll",
             r"C:\Program Files (x86)\Fuji Xerox\DocuWorks Viewer Light\XDWAPI.dll",
             r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light\XDWAPI.dll",
+            r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light 10\XDWAPI.dll",
             # ワイルドカードでバージョン番号付きフォルダも拾う
             r"C:\Program Files\*\DocuWorks\XDWAPI.dll",
             r"C:\Program Files (x86)\*\DocuWorks\XDWAPI.dll",
@@ -127,6 +131,8 @@ def _setup_xdw_dll_path():
             r"C:\Program Files\Fuji Xerox\*\XDWAPI.dll",
             r"C:\Program Files (x86)\FUJIFILM\*\XDWAPI.dll",
             r"C:\Program Files (x86)\Fuji Xerox\*\XDWAPI.dll",
+            r"C:\Program Files\*\*\XDWAPI.dll",
+            r"C:\Program Files (x86)\*\*\XDWAPI.dll",
             # システム全域
             r"C:\Windows\System32\XDWAPI.dll",
             r"C:\Windows\SysWOW64\XDWAPI.dll",
@@ -198,9 +204,19 @@ def _build_xdw2text_candidates() -> List[str]:
                     for value_name in ("InstallPath", "Path", "Install_Dir", ""):
                         try:
                             install_path, _ = winreg.QueryValueEx(key, value_name)
-                            exe = os.path.join(str(install_path), "xdw2text.exe")
-                            if os.path.isfile(exe) and exe not in candidates:
-                                candidates.insert(1, exe)
+                            base = str(install_path)
+                            rel_candidates = [
+                                "xdw2text.exe",
+                                os.path.join("bin", "xdw2text.exe"),
+                                os.path.join("Program", "xdw2text.exe"),
+                                os.path.join("DocuWorks", "xdw2text.exe"),
+                                os.path.join("DocuWorks Viewer Light", "xdw2text.exe"),
+                                os.path.join("DocuWorks Viewer Light 10", "xdw2text.exe"),
+                            ]
+                            for rel in rel_candidates:
+                                exe = os.path.join(base, rel)
+                                if os.path.isfile(exe) and exe not in candidates:
+                                    candidates.insert(1, exe)
                         except Exception:
                             continue
                 except Exception:
@@ -217,6 +233,8 @@ def _build_xdw2text_candidates() -> List[str]:
                 r"C:\Program Files (x86)\*\xdw2text.exe",
                 r"C:\Program Files\*\*\xdw2text.exe",
                 r"C:\Program Files (x86)\*\*\xdw2text.exe",
+                r"C:\Program Files\*\*\*\xdw2text.exe",
+                r"C:\Program Files (x86)\*\*\*\xdw2text.exe",
             ]:
                 for found in _glob.glob(pattern):
                     if found not in candidates:
@@ -234,7 +252,9 @@ def _build_xdw2text_candidates() -> List[str]:
             r"C:\Program Files\Fuji Xerox\DocuWorks Viewer Light\xdw2text.exe",
             r"C:\Program Files (x86)\Fuji Xerox\DocuWorks Viewer Light\xdw2text.exe",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light\xdw2text.exe",
+            r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light 10\xdw2text.exe",
             r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light\xdw2text.exe",
+            r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light 10\xdw2text.exe",
             r"C:\Program Files\TokiwaWorks\xdw2text.exe",
             r"C:\Program Files (x86)\TokiwaWorks\xdw2text.exe",
             r"C:\Program Files\DocuWorks\xdw2text.exe",
@@ -2087,6 +2107,32 @@ def extract_csv(path: str) -> Tuple[str, str]:
             continue
     return "", "csv_err"
 
+def extract_xml(path: str) -> Tuple[str, str]:
+    """XMLファイルを読み込み、タグを除去した可読テキストを返す。"""
+    raw = ""
+    for enc in ("utf-8-sig", "utf-8", "cp932", "latin-1"):
+        try:
+            with open(get_safe_path(path), "r", encoding=enc, errors="ignore") as f:
+                raw = f.read()
+            break
+        except Exception:
+            continue
+    if not raw:
+        return "", "xml_err"
+
+    # 最低限の可読化（タグ除去）
+    text = re.sub(r"<\?xml[^>]*\?>", "", raw, flags=re.IGNORECASE)
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = _html.unescape(text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text.replace("\r\n", "\n").replace("\r", "\n"))
+    text = text.strip()
+
+    if text:
+        return text, "xml_text"
+    return raw, "xml_raw"
+
 def write_html_report(outdir: str, records: List[Record]):
     """人間が見やすいHTMLレポートを生成する（ブラウザで開くだけでOK）"""
     def esc(s: object) -> str:
@@ -2103,7 +2149,7 @@ def write_html_report(outdir: str, records: List[Record]):
         ".pdf": "PDF", ".docx": "Word",
         ".xlsx": "Excel", ".xlsm": "Excel", ".xls": "Excel",
         ".xdw": "DocuWorks", ".xbd": "DocuWorks",
-        ".txt": "テキスト", ".csv": "CSV",
+        ".txt": "テキスト", ".csv": "CSV", ".xml": "XML",
     }
     ext_counts: Dict[str, int] = {}
     for r in records:
@@ -2751,6 +2797,8 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
                 text, method = extract_txt(path)
             elif ext == ".csv":
                 text, method = extract_csv(path)
+            elif ext == ".xml":
+                text, method = extract_xml(path)
         except Exception as e:
             method, reason = "error", f"抽出エラー: {e.__class__.__name__}"
 
@@ -2790,7 +2838,7 @@ def process_folder(indir: str, outdir: str, cfg: Dict[str, object], progress_cal
                     reason = "Excelライブラリが未インストール（pip install openpyxl xlrd）"
                 else:
                     reason = f"抽出失敗: {method}"
-        elif ext in (".xlsx", ".xlsm", ".xls", ".csv", ".txt"):
+        elif ext in (".xlsx", ".xlsm", ".xls", ".csv", ".txt", ".xml"):
             pass
         elif text_len < 30:
             needs_rev = True
