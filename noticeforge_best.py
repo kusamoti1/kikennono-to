@@ -102,8 +102,10 @@ def _setup_xdw_dll_path():
                     try:
                         val, _ = winreg.QueryValueEx(key, vname)
                         d = str(val).strip()
-                        if os.path.isfile(os.path.join(d, "XDWAPI.dll")) and d not in dll_dirs:
-                            dll_dirs.append(d)
+                        for rel in ("", "bin", "Program", "DocuWorks", r"DocuWorks Viewer Light", r"DocuWorks Viewer Light 10"):
+                            base = os.path.join(d, rel) if rel else d
+                            if os.path.isfile(os.path.join(base, "XDWAPI.dll")) and base not in dll_dirs:
+                                dll_dirs.append(base)
                     except Exception:
                         continue
             except Exception:
@@ -118,8 +120,10 @@ def _setup_xdw_dll_path():
             # DocuWorks Viewer Light 専用パス（バージョン10等）
             r"C:\Program Files\Fuji Xerox\DocuWorks Viewer Light\XDWAPI.dll",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light\XDWAPI.dll",
+            r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light 10\XDWAPI.dll",
             r"C:\Program Files (x86)\Fuji Xerox\DocuWorks Viewer Light\XDWAPI.dll",
             r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light\XDWAPI.dll",
+            r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light 10\XDWAPI.dll",
             # ワイルドカードでバージョン番号付きフォルダも拾う
             r"C:\Program Files\*\DocuWorks\XDWAPI.dll",
             r"C:\Program Files (x86)\*\DocuWorks\XDWAPI.dll",
@@ -127,6 +131,8 @@ def _setup_xdw_dll_path():
             r"C:\Program Files\Fuji Xerox\*\XDWAPI.dll",
             r"C:\Program Files (x86)\FUJIFILM\*\XDWAPI.dll",
             r"C:\Program Files (x86)\Fuji Xerox\*\XDWAPI.dll",
+            r"C:\Program Files\*\*\XDWAPI.dll",
+            r"C:\Program Files (x86)\*\*\XDWAPI.dll",
             # システム全域
             r"C:\Windows\System32\XDWAPI.dll",
             r"C:\Windows\SysWOW64\XDWAPI.dll",
@@ -198,9 +204,19 @@ def _build_xdw2text_candidates() -> List[str]:
                     for value_name in ("InstallPath", "Path", "Install_Dir", ""):
                         try:
                             install_path, _ = winreg.QueryValueEx(key, value_name)
-                            exe = os.path.join(str(install_path), "xdw2text.exe")
-                            if os.path.isfile(exe) and exe not in candidates:
-                                candidates.insert(1, exe)
+                            base = str(install_path)
+                            rel_candidates = [
+                                "xdw2text.exe",
+                                os.path.join("bin", "xdw2text.exe"),
+                                os.path.join("Program", "xdw2text.exe"),
+                                os.path.join("DocuWorks", "xdw2text.exe"),
+                                os.path.join("DocuWorks Viewer Light", "xdw2text.exe"),
+                                os.path.join("DocuWorks Viewer Light 10", "xdw2text.exe"),
+                            ]
+                            for rel in rel_candidates:
+                                exe = os.path.join(base, rel)
+                                if os.path.isfile(exe) and exe not in candidates:
+                                    candidates.insert(1, exe)
                         except Exception:
                             continue
                 except Exception:
@@ -217,6 +233,8 @@ def _build_xdw2text_candidates() -> List[str]:
                 r"C:\Program Files (x86)\*\xdw2text.exe",
                 r"C:\Program Files\*\*\xdw2text.exe",
                 r"C:\Program Files (x86)\*\*\xdw2text.exe",
+                r"C:\Program Files\*\*\*\xdw2text.exe",
+                r"C:\Program Files (x86)\*\*\*\xdw2text.exe",
             ]:
                 for found in _glob.glob(pattern):
                     if found not in candidates:
@@ -234,7 +252,9 @@ def _build_xdw2text_candidates() -> List[str]:
             r"C:\Program Files\Fuji Xerox\DocuWorks Viewer Light\xdw2text.exe",
             r"C:\Program Files (x86)\Fuji Xerox\DocuWorks Viewer Light\xdw2text.exe",
             r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light\xdw2text.exe",
+            r"C:\Program Files\FUJIFILM\DocuWorks Viewer Light 10\xdw2text.exe",
             r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light\xdw2text.exe",
+            r"C:\Program Files (x86)\FUJIFILM\DocuWorks Viewer Light 10\xdw2text.exe",
             r"C:\Program Files\TokiwaWorks\xdw2text.exe",
             r"C:\Program Files (x86)\TokiwaWorks\xdw2text.exe",
             r"C:\Program Files\DocuWorks\xdw2text.exe",
@@ -1715,6 +1735,7 @@ def copy_source_files_batched(
       - 各バッチフォルダ: 原本コピー_ノートブック01/ 〜
       - 1ファイルあたり 50MB 超はスキップ（サイズ超過として記録）
       - 各バッチ: max slots_per_batch 件 かつ 合計 250MB 以内
+      - 可能な環境では小容量PDFを統合し、ファイル数を圧縮（内容は非圧縮・無加工）
 
     戻り値:
       batches: [(batch_dir, [file_paths]), ...] バッチごとの (フォルダ, ファイルリスト)
@@ -1724,6 +1745,10 @@ def copy_source_files_batched(
     MAX_BATCH_BYTES = 250 * 1024 * 1024   # 250MB / バッチ
 
     COPYABLE_EXTS = {".pdf"}
+
+    # 統合PDFの上限（NotebookLMの1ファイル制限より少し小さめ）
+    MERGE_TARGET_BYTES = 45 * 1024 * 1024
+    MERGE_MAX_INPUTS = 12
 
     # 前回の原本コピーフォルダをすべて削除して再生成
     for entry in os.listdir(outdir):
@@ -1758,6 +1783,105 @@ def copy_source_files_batched(
         current_bytes = 0
         return d
 
+    def _safe_dst_name(name: str) -> str:
+        safe_name = name.replace(os.sep, "_").replace("/", "_")
+        base, ext = os.path.splitext(safe_name)
+        candidate = safe_name
+        counter = 1
+        while candidate in used_names:
+            candidate = f"{base}_{counter}{ext}"
+            counter += 1
+        used_names.add(candidate)
+        return candidate
+
+    def _can_merge(r: Record, file_size: int) -> bool:
+        # fitz が使える環境のみ統合。大きめPDFは単体のまま保持して見通しを確保。
+        return bool(fitz) and file_size <= 15 * 1024 * 1024 and r.ext.lower() == ".pdf"
+
+    merge_group: List[Tuple[Record, str, int]] = []
+
+    def _emit_single(src: str, relpath: str, file_size: int):
+        nonlocal current_bytes
+        if current_dir is None or len(current_files) >= slots_per_batch or current_bytes + file_size > MAX_BATCH_BYTES:
+            _new_batch()
+
+        dst = os.path.join(current_dir, _safe_dst_name(relpath))
+        try:
+            shutil.copy2(get_safe_path(src), dst)
+            current_files.append(dst)
+            current_bytes += file_size
+        except Exception:
+            skipped.append((relpath, "コピーに失敗"))
+
+    def _emit_merged(group: List[Tuple[Record, str, int]]):
+        nonlocal current_bytes
+        if not group:
+            return
+        if not fitz:
+            for rec, src, size in group:
+                _emit_single(src, rec.relpath, size)
+            return
+
+        sum_bytes = sum(s for _, _, s in group)
+        if current_dir is None or len(current_files) >= slots_per_batch or current_bytes + sum_bytes > MAX_BATCH_BYTES:
+            _new_batch()
+
+        merged_name = _safe_dst_name(f"統合原本_{len(current_files)+1:02d}.pdf")
+        merged_path = os.path.join(current_dir, merged_name)
+        index_name = os.path.splitext(merged_name)[0] + "_目次.txt"
+        index_path = os.path.join(current_dir, _safe_dst_name(index_name))
+
+        merged_doc = fitz.open()
+        index_lines = ["【統合原本PDF 収録一覧】", ""]
+
+        try:
+            for rec, src, _ in group:
+                part = fitz.open(get_safe_path(src))
+                try:
+                    start = merged_doc.page_count + 1
+                    merged_doc.insert_pdf(part)
+                    end = merged_doc.page_count
+                    index_lines.append(f"- p.{start}-p.{end}: {rec.relpath}")
+                finally:
+                    part.close()
+
+            merged_doc.save(merged_path)
+            merged_doc.close()
+
+            out_size = os.path.getsize(get_safe_path(merged_path))
+            if out_size > MAX_FILE_BYTES:
+                # 念のため上限超過時は単体コピーにフォールバック
+                try:
+                    os.remove(get_safe_path(merged_path))
+                except Exception:
+                    pass
+                for rec, src, size in group:
+                    _emit_single(src, rec.relpath, size)
+                return
+
+            with open(get_safe_path(index_path), "w", encoding="utf-8") as f:
+                f.write("\n".join(index_lines) + "\n")
+
+            current_files.append(merged_path)
+            current_files.append(index_path)
+            current_bytes += out_size + os.path.getsize(get_safe_path(index_path))
+        except Exception:
+            try:
+                merged_doc.close()
+            except Exception:
+                pass
+            for rec, src, size in group:
+                _emit_single(src, rec.relpath, size)
+
+    def _flush_merge_group(force: bool = False):
+        nonlocal merge_group
+        if not merge_group:
+            return
+        total = sum(s for _, _, s in merge_group)
+        if force or len(merge_group) >= MERGE_MAX_INPUTS or total >= MERGE_TARGET_BYTES:
+            _emit_merged(merge_group)
+            merge_group = []
+
     for r in records:
         if r.ext.lower() not in COPYABLE_EXTS:
             continue
@@ -1772,33 +1896,14 @@ def copy_source_files_batched(
             skipped.append((r.relpath, f"ファイルサイズ超過 ({file_size // (1024*1024)}MB > 50MB)"))
             continue
 
-        # バッチが未作成、または現バッチが満杯なら新バッチ開始
-        need_new = (
-            current_dir is None
-            or len(current_files) >= slots_per_batch
-            or current_bytes + file_size > MAX_BATCH_BYTES
-        )
-        if need_new:
-            _new_batch()
+        if _can_merge(r, file_size):
+            merge_group.append((r, src, file_size))
+            _flush_merge_group(force=False)
+        else:
+            _flush_merge_group(force=True)
+            _emit_single(src, r.relpath, file_size)
 
-        # フラットなファイル名（パス区切り→アンダースコア）
-        safe_name = r.relpath.replace(os.sep, "_").replace("/", "_")
-        base, ext = os.path.splitext(safe_name)
-        candidate = safe_name
-        counter = 1
-        while candidate in used_names:
-            candidate = f"{base}_{counter}{ext}"
-            counter += 1
-        used_names.add(candidate)
-
-        dst = os.path.join(current_dir, candidate)
-        try:
-            shutil.copy2(get_safe_path(src), dst)
-            current_files.append(dst)
-            current_bytes += file_size
-        except Exception:
-            pass
-
+    _flush_merge_group(force=True)
     _flush()
     return batches, skipped
 
@@ -1851,12 +1956,12 @@ def write_notebook_preamble(
     lines += [
         "",
         "─" * 40,
-        "■ 原本PDFファイル（個別にアップロード）",
+        "■ 原本ファイル（PDF。必要に応じて統合済み）",
         "─" * 40,
-        f"  合計 {total_pdf}ファイル（複数ノートブックに分割して投入）",
+        f"  合計 {total_pdf}ファイル（統合により件数を抑えて分割投入）",
         "",
-        "  元のPDFをそのままアップロードしたものです。",
-        "  テキスト抽出ファイルと同じ文書の正本です。",
+        "  元PDFを基に、NotebookLMの件数上限対策として一部を統合しています。",
+        "  内容は削除せず保持し、同梱の収録一覧で元文書を追跡できます。",
         "",
         "=" * 60,
         "■ 回答時に必ず守ってほしい注意事項",
@@ -1903,7 +2008,7 @@ def write_upload_guide(
         "【NotebookLMへの投入ガイド】",
         "=" * 60,
         "",
-        f"原本PDF総数: {total_pdf}件  → {nb_count}つのノートブックに分割",
+        f"原本フォルダ内ファイル総数: {total_pdf}件  → {nb_count}つのノートブックに分割",
         f"テキストバンドル: {len(bundle_files)}件（全ノートブックに投入）",
         f"50MB超のためスキップ: {len(skipped_files)}件",
         "",
@@ -1930,7 +2035,7 @@ def write_upload_guide(
         ]
         for f in bundle_files:
             lines.append(f"  ② {os.path.basename(f)}（テキストバンドル・全部入れる）")
-        lines.append(f"  ③ {batch_name}/ フォルダ内の全PDFをアップロード")
+        lines.append(f"  ③ {batch_name}/ フォルダ内の全ファイル（PDFと収録一覧）をアップロード")
         lines.append("")
 
     if skipped_files:
