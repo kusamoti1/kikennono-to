@@ -17,3 +17,27 @@
 ## 3. NotebookLMへ入れるもの
 - 00_統合目次.md
 - docs_txt（中のtxt全部）
+
+## 4. 法令データの取り込みについて（変更点）
+- 外部サイト（e-Gov API）からの自動取り込みは行いません。
+- 取り込む資料は、あなたが選んだファイルだけにします。
+- `egov_downloader.py` を実行すると、手動取り込み用のCSVとガイドが作られます。
+  - `python egov_downloader.py`
+  - 作成された `取り込み候補_記入用.csv` にファイルパスを入れて、`取り込む(1/0)` を `1` にする
+  - `python egov_downloader.py --apply-csv 危険物法令/取り込み候補_記入用.csv`
+
+
+## 5. 50ファイル・250MB制限への対応（NotebookLM）
+- 原本PDFは、精度を落とさない範囲で自動的に「統合PDF」にまとめます。
+- これにより、ファイル数を減らしてNotebookLMの50ファイル制限に収めやすくします。
+- 統合したPDFには「収録一覧」ファイルが付き、どの原本が入っているか確認できます。
+
+
+## 6. DocuWorks（.xdw）が読めないとき
+- 無料の **DocuWorks Viewer Light 10** を使えます。
+- 本アプリは Viewer Light 10 のインストール場所（通常/`bin`/`Program`）を自動検出します。
+- それでも読めない場合は、次の順で確認してください。
+  1. Viewer Light 10 を再インストール（管理者権限）
+  2. インストール先に `XDWAPI.dll` があるか確認
+  3. インストール先（または `bin` / `Program`）に `xdw2text.exe` があるか確認
+  4. `xdw2text.exe` が無い場合は無料の `xdoc2txt.exe` を追加
